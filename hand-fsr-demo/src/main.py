@@ -1,25 +1,28 @@
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+import pyqtgraph as pg
 from PyQt6.QtCore import QObject, QSettings, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtGui import QColor, QPainter, QPen, QPalette, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
-    QPlainTextEdit,
     QSpinBox,
+    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
-# 串口依赖：任务12新增
+# 串口依赖（可选）
 try:
     import serial
     import serial.tools.list_ports
@@ -41,7 +44,7 @@ class MockDataSource:
     """
     模拟数据源：
     - 输出 16x16 压力矩阵，范围 0~1000
-    - 每 20 帧更新一次“压力场景”
+    - 每 20 帧更新一次"压力场景"
     """
 
     def __init__(self) -> None:
@@ -79,8 +82,6 @@ class MockDataSource:
             scenario=self._current_scenario,
         )
         self._index += 1
-
-        # 数据源频率高于 UI 刷新频率
         time.sleep(0.01)  # ~100Hz
         return frame
 
@@ -99,7 +100,6 @@ class MockDataSource:
         rr, cc = np.indices((16, 16))
         checker = ((rr + cc) % 2).astype(np.float32)
         matrix += checker * self._rng.uniform(80, 180)
-
         return np.clip(matrix, 0.0, 1000.0).astype(np.float32)
 
     def _scene_uniform(self) -> np.ndarray:
@@ -132,12 +132,10 @@ class MockDataSource:
 
     def _scene_line_pressure(self) -> np.ndarray:
         matrix = self._rng.uniform(30, 130, size=(16, 16)).astype(np.float32)
-
         row_id = int(self._rng.integers(0, 16))
         col_id = int(self._rng.integers(0, 16))
         matrix[row_id, :] += self._rng.uniform(500, 900, size=(16,))
         matrix[:, col_id] += self._rng.uniform(500, 900, size=(16,))
-
         return matrix
 
     def _scene_impact(self) -> np.ndarray:
@@ -150,7 +148,6 @@ class MockDataSource:
         sigma = float(self._rng.uniform(0.5, 1.0))
         impact = amp * np.exp(-(((rr - r0) ** 2 + (cc - c0) ** 2) / (2 * sigma**2)))
         matrix += impact.astype(np.float32)
-
         return matrix
 
 
@@ -185,13 +182,7 @@ class Worker(QObject):
 
 
 class SerialByteSource:
-    """
-    串口字节源（只读 bytes，不做解析）
-    功能：
-    - 列出串口
-    - 打开/关闭串口
-    - 读取原始 bytes
-    """
+    """串口字节源（只读 bytes，不解析）"""
 
     def __init__(self) -> None:
         self._ser = None
@@ -200,12 +191,11 @@ class SerialByteSource:
     def list_ports() -> list[str]:
         if not SERIAL_AVAILABLE:
             return []
-        ports = serial.tools.list_ports.comports()
-        return [p.device for p in ports]
+        return [p.device for p in serial.tools.list_ports.comports()]
 
     def open(self, port: str, baudrate: int, timeout: float = 0.2) -> None:
         if not SERIAL_AVAILABLE:
-            raise RuntimeError("pyserial 未安装，请先执行: pip install pyserial")
+            raise RuntimeError("pyserial 未安装")
         self._ser = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -227,17 +217,12 @@ class SerialByteSource:
     def read_bytes(self, max_bytes: int = 1024) -> bytes:
         if not self.is_open():
             return b""
-        # 不阻塞UI：worker线程内读取；优先读取缓冲区可用字节
         waiting = self._ser.in_waiting if self._ser is not None else 0
         size = min(max(1, waiting), max_bytes)
         return self._ser.read(size)
 
 
 class SerialWorker(QObject):
-    """
-    串口后台读取线程（必须跑在 QThread 里）
-    仅输出 bytes，不解析协议。
-    """
     bytes_received = pyqtSignal(bytes)
     log_message = pyqtSignal(str)
     status_changed = pyqtSignal(str)
@@ -258,11 +243,11 @@ class SerialWorker(QObject):
 
         try:
             self._source.open(self._port, self._baudrate, timeout=self._timeout)
-            self.status_changed.emit("串口：已打开")
-            self.log_message.emit(f"串口已打开: {self._port} @ {self._baudrate}")
+            self.status_changed.emit("已打开")
+            self.log_message.emit(f"串口已打开: {self._port}@{self._baudrate}")
         except Exception as e:
-            self.status_changed.emit("串口：打开失败")
-            self.log_message.emit(f"[错误] 串口打开失败（可能端口占用/权限不足）: {e}")
+            self.status_changed.emit("打开失败")
+            self.log_message.emit(f"[错误] 串口打开失败: {e}")
             self.finished.emit()
             return
 
@@ -271,27 +256,23 @@ class SerialWorker(QObject):
                 try:
                     data = self._source.read_bytes(max_bytes=2048)
                 except Exception as e:
-                    # 典型拔插异常会在这里出现
-                    self.log_message.emit(f"[错误] 串口读取异常（可能设备拔出）: {e}")
-                    self.status_changed.emit("串口：读取异常")
+                    self.log_message.emit(f"[错误] 串口读取异常(可能拔插): {e}")
+                    self.status_changed.emit("读取异常")
                     break
 
                 if data:
                     self.bytes_received.emit(data)
                 else:
-                    # 超时：不刷屏，2秒最多一条
                     now = time.time()
                     if now - self._last_timeout_log_ts >= 2.0:
                         self._last_timeout_log_ts = now
-                        self.log_message.emit("[提示] 串口读取超时：当前未收到新字节。")
+                        self.log_message.emit("[提示] 串口读取超时")
         finally:
             try:
                 self._source.close()
-            except Exception as e:
-                self.log_message.emit(f"[警告] 串口关闭时异常: {e}")
-
-            self.status_changed.emit("串口：已关闭")
-            self.log_message.emit("串口已关闭。")
+            except Exception:
+                pass
+            self.status_changed.emit("已关闭")
             self.finished.emit()
 
     @pyqtSlot()
@@ -305,7 +286,9 @@ class HeatmapGridWidget(QWidget):
     - 单元严格正方形
     - 间隙可配置
     - 自适应窗口尺寸
+    - 背景：系统默认色
     """
+
     def __init__(self, rows: int = 16, cols: int = 16, gap_px: int = 2) -> None:
         super().__init__()
         self.rows = rows
@@ -315,8 +298,9 @@ class HeatmapGridWidget(QWidget):
         self.vmin = 0.0
         self.vmax = 1000.0
         self._matrix = np.zeros((rows, cols), dtype=np.float32)
-        self._lut = self._build_colormap_lut("jet")
+        self._lut = self._build_jet_lut()
         self.setMinimumSize(360, 360)
+        self.setAutoFillBackground(True)
 
     def set_matrix(self, matrix: np.ndarray) -> None:
         if matrix.shape != (self.rows, self.cols):
@@ -328,38 +312,17 @@ class HeatmapGridWidget(QWidget):
         self.gap_px = max(0, int(gap_px))
         self.update()
 
-    def set_colormap(self, name: str) -> None:
-        self._lut = self._build_colormap_lut(name)
-        self.update()
-
-    def _build_colormap_lut(self, name: str) -> np.ndarray:
-        schemes = {
-            "jet": [
-                (0.00, (0, 0, 130)),
-                (0.20, (0, 80, 255)),
-                (0.45, (0, 220, 220)),
-                (0.65, (80, 255, 80)),
-                (0.82, (255, 230, 0)),
-                (0.92, (255, 120, 0)),
-                (1.00, (200, 0, 0)),
-            ],
-            "viridis": [
-                (0.00, (68, 1, 84)),
-                (0.25, (59, 82, 139)),
-                (0.50, (33, 145, 140)),
-                (0.75, (94, 201, 98)),
-                (1.00, (253, 231, 37)),
-            ],
-            "plasma": [
-                (0.00, (13, 8, 135)),
-                (0.25, (126, 3, 167)),
-                (0.50, (203, 71, 119)),
-                (0.75, (248, 149, 64)),
-                (1.00, (240, 249, 33)),
-            ],
-        }
-        anchors = schemes.get(name, schemes["jet"])
-
+    def _build_jet_lut(self) -> np.ndarray:
+        """生成 jet 色彩查询表"""
+        anchors = [
+            (0.00, (0, 0, 130)),
+            (0.20, (0, 80, 255)),
+            (0.45, (0, 220, 220)),
+            (0.65, (80, 255, 80)),
+            (0.82, (255, 230, 0)),
+            (0.92, (255, 120, 0)),
+            (1.00, (200, 0, 0)),
+        ]
         x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
         xp = np.array([p for p, _ in anchors], dtype=np.float32)
         rgb = np.array([c for _, c in anchors], dtype=np.float32)
@@ -380,7 +343,9 @@ class HeatmapGridWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
-        painter.fillRect(self.rect(), QColor(18, 18, 22))
+        # 背景：系统默认色
+        bg = self.palette().color(QPalette.ColorRole.Window)
+        painter.fillRect(self.rect(), bg)
 
         w = self.width()
         h = self.height()
@@ -390,7 +355,7 @@ class HeatmapGridWidget(QWidget):
         avail_w = max(1, w - 2 * margin - (self.cols - 1) * gap)
         avail_h = max(1, h - 2 * margin - (self.rows - 1) * gap)
 
-        # 核心：严格正方形
+        # 核心：严格正方形单元
         cell = max(1, int(min(avail_w / self.cols, avail_h / self.rows)))
 
         grid_w = cell * self.cols + gap * (self.cols - 1)
@@ -398,6 +363,7 @@ class HeatmapGridWidget(QWidget):
         x0 = (w - grid_w) // 2
         y0 = (h - grid_h) // 2
 
+        # 绘制 16x16 单元
         painter.setPen(Qt.PenStyle.NoPen)
         for r in range(self.rows):
             for c in range(self.cols):
@@ -407,7 +373,8 @@ class HeatmapGridWidget(QWidget):
                 y = y0 + r * (cell + gap)
                 painter.drawRect(x, y, cell, cell)
 
-        border_pen = QPen(QColor(220, 220, 220, 140))
+        # 边框
+        border_pen = QPen(QColor(120, 120, 120, 120))
         border_pen.setWidth(1)
         painter.setPen(border_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -415,8 +382,14 @@ class HeatmapGridWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
+    """
+    主窗口布局：
+    - 顶部：紧凑控制栏
+    - 中间：左右并列（左：热力图，右：数据分析）
+    - 底部：单行状态栏
+    """
+
     UNIT_FACTORS = {
-        # 设置仅影响显示层，不改变底层数据
         "raw": 1.0,
         "g": 1.0,
         "N": 0.00980665,
@@ -424,16 +397,13 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Hand FSR Demo - Settings + Serial Bytes")
-        self.resize(1250, 900)
+        self.setWindowTitle("Hand FSR Demo - Optimized Layout")
+        self.resize(1400, 900)
 
         self._settings = QSettings("NJIT", "HandFSR")
 
-        # Mock 线程
         self._thread: Optional[QThread] = None
         self._worker: Optional[Worker] = None
-
-        # 串口线程
         self._serial_thread: Optional[QThread] = None
         self._serial_worker: Optional[SerialWorker] = None
 
@@ -442,36 +412,34 @@ class MainWindow(QMainWindow):
         self._frame_count = 0
         self._ui_fps = 0.0
         self._last_ui_time: Optional[float] = None
-        self._last_logged_data_update = -1
 
-        # 串口字节统计
         self._serial_rx_total = 0
-        self._serial_rx_last = 0
-        self._serial_last_preview_ts = 0.0
+        self._serial_state_text = "未打开"
+
+        # 会话统计
+        self._session_max = float("-inf")
+        self._session_min = float("inf")
+
+        # 历史缓存：60秒窗口按20Hz约1200点，留余量
+        self._t0 = time.time()
+        self._time_hist = deque(maxlen=2400)
+        self._total_hist = deque(maxlen=2400)
+        self._current_hist = deque(maxlen=2400)
 
         # 读取持久化设置
         self._unit = self._settings.value("display/unit", "raw", type=str)
         self._decimals = self._settings.value("display/decimals", 1, type=int)
         self._ui_interval_ms = self._settings.value("display/ui_interval_ms", 50, type=int)
 
-        # 基础控件（Mock）
+        # ========== 顶部控制栏（紧凑） ==========
         self._btn_connect = QPushButton("连接(Mock)")
         self._btn_disconnect = QPushButton("断开(Mock)")
         self._btn_disconnect.setEnabled(False)
 
-        self._status = QLabel("状态：未连接")
-        self._stats = QLabel("sum: 0.0 | max: 0.0 | min: 0.0 | mean: 0.0 | UI_fps: 0.0 | 场景: -")
-
-        self._combo_colormap = QComboBox()
-        self._combo_colormap.addItems(["jet", "viridis", "plasma"])
-        self._combo_colormap.setCurrentText("jet")
-
         self._spin_gap = QSpinBox()
         self._spin_gap.setRange(0, 8)
         self._spin_gap.setValue(2)
-        self._spin_gap.setSingleStep(1)
 
-        # 设置区域（任务8）
         self._combo_unit = QComboBox()
         self._combo_unit.addItems(["raw", "g", "N"])
         if self._unit not in ("raw", "g", "N"):
@@ -487,92 +455,173 @@ class MainWindow(QMainWindow):
         self._spin_ui_interval.setValue(max(20, min(200, int(self._ui_interval_ms))))
         self._spin_ui_interval.setSuffix(" ms")
 
-        # 串口区域（任务12）
+        # 串口控件
         self._btn_refresh_ports = QPushButton("刷新串口")
         self._combo_ports = QComboBox()
         self._combo_baud = QComboBox()
         self._combo_baud.addItems(["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"])
         self._combo_baud.setCurrentText("115200")
-
         self._btn_serial_open = QPushButton("打开串口")
         self._btn_serial_close = QPushButton("关闭串口")
         self._btn_serial_close.setEnabled(False)
 
-        self._serial_status = QLabel("串口：未打开")
-        self._serial_rx_label = QLabel("RX: 0 bytes")
+        # 控制栏布局
+        controls = QHBoxLayout()
+        controls.addWidget(self._btn_connect)
+        controls.addWidget(self._btn_disconnect)
+        controls.addSpacing(10)
+        controls.addWidget(QLabel("间隙"))
+        controls.addWidget(self._spin_gap)
+        controls.addSpacing(10)
+        controls.addWidget(QLabel("单位"))
+        controls.addWidget(self._combo_unit)
+        controls.addWidget(QLabel("小数"))
+        controls.addWidget(self._spin_decimals)
+        controls.addWidget(QLabel("刷新"))
+        controls.addWidget(self._spin_ui_interval)
+        controls.addSpacing(10)
+        controls.addWidget(self._btn_refresh_ports)
+        controls.addWidget(self._combo_ports)
+        controls.addWidget(self._combo_baud)
+        controls.addWidget(self._btn_serial_open)
+        controls.addWidget(self._btn_serial_close)
+        controls.addStretch()
 
-        self._log = QPlainTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setMaximumHeight(170)
-
+        # ========== 左栏：热力图 ==========
         self._heatmap = HeatmapGridWidget(rows=16, cols=16, gap_px=2)
+        
+        left_title = QLabel("热力图（Jet 色彩）")
+        left_title_font = QFont()
+        left_title_font.setPointSize(11)
+        left_title_font.setBold(True)
+        left_title.setFont(left_title_font)
 
-        # 布局
-        top = QHBoxLayout()
-        top.addWidget(self._btn_connect)
-        top.addWidget(self._btn_disconnect)
-        top.addSpacing(12)
-        top.addWidget(QLabel("色图:"))
-        top.addWidget(self._combo_colormap)
-        top.addSpacing(8)
-        top.addWidget(QLabel("间隙(px):"))
-        top.addWidget(self._spin_gap)
-        top.addStretch()
-        top.addWidget(self._status)
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(left_title)
+        left_panel.addWidget(self._heatmap, stretch=1)
+        left_panel.setContentsMargins(8, 8, 8, 8)
+        left_widget = QWidget()
+        left_widget.setLayout(left_panel)
 
-        settings_bar = QHBoxLayout()
-        settings_bar.addWidget(QLabel("显示单位:"))
-        settings_bar.addWidget(self._combo_unit)
-        settings_bar.addSpacing(12)
-        settings_bar.addWidget(QLabel("小数位:"))
-        settings_bar.addWidget(self._spin_decimals)
-        settings_bar.addSpacing(12)
-        settings_bar.addWidget(QLabel("UI刷新周期:"))
-        settings_bar.addWidget(self._spin_ui_interval)
-        settings_bar.addStretch()
+        # ========== 右栏：数据分析 ==========
+        title_font = QFont()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
 
-        serial_bar = QHBoxLayout()
-        serial_bar.addWidget(self._btn_refresh_ports)
-        serial_bar.addWidget(QLabel("端口:"))
-        serial_bar.addWidget(self._combo_ports)
-        serial_bar.addWidget(QLabel("波特率:"))
-        serial_bar.addWidget(self._combo_baud)
-        serial_bar.addWidget(self._btn_serial_open)
-        serial_bar.addWidget(self._btn_serial_close)
-        serial_bar.addSpacing(12)
-        serial_bar.addWidget(self._serial_status)
-        serial_bar.addSpacing(8)
-        serial_bar.addWidget(self._serial_rx_label)
-        serial_bar.addStretch()
+        data_font = QFont()
+        data_font.setPointSize(10)
 
+        value_font = QFont()
+        value_font.setPointSize(12)
+        value_font.setBold(True)
+
+        right_title = QLabel("数据分析")
+        right_title.setFont(title_font)
+
+        # 数值显示区：标签 + 右对齐数值
+        metrics_grid = QGridLayout()
+        metrics_grid.setHorizontalSpacing(12)
+        metrics_grid.setVerticalSpacing(8)
+
+        lbl_total_name = QLabel("压力总值")
+        lbl_current_name = QLabel("当前压力值")
+        lbl_max_name = QLabel("会话最大值")
+        lbl_min_name = QLabel("会话最小值")
+
+        for lbl in [lbl_total_name, lbl_current_name, lbl_max_name, lbl_min_name]:
+            lbl.setFont(data_font)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._val_total = QLabel("0.0")
+        self._val_current = QLabel("0.0")
+        self._val_max = QLabel("-")
+        self._val_min = QLabel("-")
+
+        for val in [self._val_total, self._val_current, self._val_max, self._val_min]:
+            val.setFont(value_font)
+            val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val.setStyleSheet("QLabel { background: white; border: 1px solid #BFBFBF; padding: 4px 8px; }")
+            val.setMinimumWidth(140)
+
+        metrics_grid.addWidget(lbl_total_name, 0, 0)
+        metrics_grid.addWidget(self._val_total, 0, 1)
+        metrics_grid.addWidget(lbl_current_name, 1, 0)
+        metrics_grid.addWidget(self._val_current, 1, 1)
+        metrics_grid.addWidget(lbl_max_name, 2, 0)
+        metrics_grid.addWidget(self._val_max, 2, 1)
+        metrics_grid.addWidget(lbl_min_name, 3, 0)
+        metrics_grid.addWidget(self._val_min, 3, 1)
+
+        # 时间窗口选择
+        self._combo_time_window = QComboBox()
+        self._combo_time_window.addItems(["10 s", "30 s", "60 s"])
+        self._combo_time_window.setCurrentText("30 s")
+
+        tw_bar = QHBoxLayout()
+        tw_bar.addWidget(QLabel("时间窗"))
+        tw_bar.addWidget(self._combo_time_window)
+        tw_bar.addStretch()
+
+        # 两条曲线图：白底黑字
+        self._plot_total = pg.PlotWidget(title="总值-时间")
+        self._setup_white_black_plot(self._plot_total)
+        self._curve_total = self._plot_total.plot([], [], pen=pg.mkPen("k", width=2))
+
+        self._plot_current = pg.PlotWidget(title="当前值-时间")
+        self._setup_white_black_plot(self._plot_current)
+        self._curve_current = self._plot_current.plot(
+            [], [], pen=pg.mkPen("k", width=2, style=Qt.PenStyle.DashLine)
+        )
+
+        # 右栏布局
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(right_title)
+        right_panel.addLayout(metrics_grid)
+        right_panel.addLayout(tw_bar)
+        right_panel.addWidget(self._plot_total, stretch=1)
+        right_panel.addWidget(self._plot_current, stretch=1)
+        right_panel.setContentsMargins(8, 8, 8, 8)
+        right_widget = QWidget()
+        right_widget.setLayout(right_panel)
+
+        # ========== 主工作区：左右并列 ==========
+        work_layout = QHBoxLayout()
+        work_layout.addWidget(left_widget, stretch=3)
+        work_layout.addWidget(right_widget, stretch=2)
+        work_layout.setContentsMargins(0, 0, 0, 0)
+
+        # ========== 底部单行状态栏 ==========
+        self._statusbar = QStatusBar(self)
+        self.setStatusBar(self._statusbar)
+        self._statusbar.showMessage("系统就绪")
+
+        # ========== 主布局 ==========
         root = QVBoxLayout()
-        root.addLayout(top)
-        root.addLayout(settings_bar)
-        root.addLayout(serial_bar)
-        root.addWidget(self._stats)
-        root.addWidget(self._heatmap, stretch=1)
-        root.addWidget(self._log)
+        root.addLayout(controls)
+        root.addLayout(work_layout, stretch=1)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
 
-        center = QWidget()
-        center.setLayout(root)
-        self.setCentralWidget(center)
+        central = QWidget()
+        central.setLayout(root)
+        self.setCentralWidget(central)
 
-        # 信号：Mock
+        # ========== 信号连接 ==========
         self._btn_connect.clicked.connect(self.on_connect_clicked)
         self._btn_disconnect.clicked.connect(self.on_disconnect_clicked)
-        self._combo_colormap.currentTextChanged.connect(self._heatmap.set_colormap)
         self._spin_gap.valueChanged.connect(self._heatmap.set_gap)
 
-        # 信号：任务8设置
         self._combo_unit.currentTextChanged.connect(self.on_display_settings_changed)
         self._spin_decimals.valueChanged.connect(self.on_display_settings_changed)
         self._spin_ui_interval.valueChanged.connect(self.on_display_settings_changed)
 
-        # 信号：任务12串口
         self._btn_refresh_ports.clicked.connect(self.on_refresh_ports_clicked)
         self._btn_serial_open.clicked.connect(self.on_serial_open_clicked)
         self._btn_serial_close.clicked.connect(self.on_serial_close_clicked)
 
+        self._combo_time_window.currentTextChanged.connect(self.apply_plot_time_window)
+
+        # UI 刷新定时器
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(self._spin_ui_interval.value())
         self._ui_timer.timeout.connect(self.refresh_ui)
@@ -581,17 +630,51 @@ class MainWindow(QMainWindow):
         # 初始化
         self.apply_display_settings()
         self.on_refresh_ports_clicked()
+        self.apply_plot_time_window()
 
         if not SERIAL_AVAILABLE:
-            self.append_log("[警告] 未检测到 pyserial。请安装: pip install pyserial")
-            self._serial_status.setText("串口：不可用（缺少 pyserial）")
-            self._btn_serial_open.setEnabled(False)
-            self._btn_refresh_ports.setEnabled(False)
+            self._statusbar.showMessage("系统就绪 | 串口不可用(缺少 pyserial)")
 
-    def append_log(self, text: str) -> None:
-        self._log.appendPlainText(text)
+    def _setup_white_black_plot(self, plot: pg.PlotWidget) -> None:
+        """配置曲线图：白底、黑色坐标轴与文字"""
+        plot.setBackground("w")
+        plot.showGrid(x=True, y=True, alpha=0.2)
 
-    # ---------------- Mock 热力图逻辑（保持原有） ----------------
+        # 坐标轴黑色
+        axis_left = plot.getAxis("left")
+        axis_bottom = plot.getAxis("bottom")
+        axis_left.setPen(pg.mkPen("k", width=1))
+        axis_bottom.setPen(pg.mkPen("k", width=1))
+        axis_left.setTextPen(pg.mkPen("k"))
+        axis_bottom.setTextPen(pg.mkPen("k"))
+
+        plot.setLabel("left", color="#000000")
+        plot.setLabel("bottom", "Time(s)", color="#000000")
+
+    def _get_time_window_seconds(self) -> float:
+        """根据选择的时间窗返回秒数"""
+        text = self._combo_time_window.currentText().strip()
+        if text.startswith("10"):
+            return 10.0
+        if text.startswith("60"):
+            return 60.0
+        return 30.0
+
+    def apply_plot_time_window(self) -> None:
+        """应用时间窗口范围到两条曲线图"""
+        if len(self._time_hist) == 0:
+            window = self._get_time_window_seconds()
+            self._plot_total.setXRange(0, window, padding=0.0)
+            self._plot_current.setXRange(0, window, padding=0.0)
+            return
+
+        window = self._get_time_window_seconds()
+        t_end = self._time_hist[-1]
+        t_start = max(0.0, t_end - window)
+        self._plot_total.setXRange(t_start, t_end, padding=0.0)
+        self._plot_current.setXRange(t_start, t_end, padding=0.0)
+
+    # ========== Mock 逻辑 ==========
     @pyqtSlot()
     def on_connect_clicked(self) -> None:
         if self._thread is not None:
@@ -609,14 +692,20 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.finished.connect(self.on_thread_finished)
 
+        # 新会话重置
+        self._session_max = float("-inf")
+        self._session_min = float("inf")
+        self._time_hist.clear()
+        self._total_hist.clear()
+        self._current_hist.clear()
+        self._t0 = time.time()
+
         self._thread.start()
         self._btn_connect.setEnabled(False)
         self._btn_disconnect.setEnabled(True)
-        self.append_log("已连接：开始模拟压力数据。")
 
     @pyqtSlot()
     def on_disconnect_clicked(self) -> None:
-        self.append_log("正在断开 Mock...")
         self.stop_worker()
 
     @pyqtSlot(object)
@@ -625,15 +714,9 @@ class MainWindow(QMainWindow):
             self._latest_frame = frame
             self._frame_count += 1
 
-            update_id = frame.index // 20
-            if update_id != self._last_logged_data_update:
-                self._last_logged_data_update = update_id
-                self.append_log(f"数据更新: frame={frame.index}, scene={frame.scenario}")
-
     @pyqtSlot(str)
     def on_status_changed(self, text: str) -> None:
         self._connected = (text == "状态：已连接")
-        self._status.setText(text)
 
     @pyqtSlot()
     def on_thread_finished(self) -> None:
@@ -642,18 +725,15 @@ class MainWindow(QMainWindow):
         self._connected = False
         self._btn_connect.setEnabled(True)
         self._btn_disconnect.setEnabled(False)
-        self._status.setText("状态：未连接")
-        self.append_log("Mock 已断开。")
 
     def stop_worker(self) -> None:
         if self._worker is not None:
             self._worker.stop()
-
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
 
-    # ---------------- 任务8：显示设置 ----------------
+    # ========== 显示设置 ==========
     @pyqtSlot()
     def on_display_settings_changed(self) -> None:
         self.apply_display_settings()
@@ -663,8 +743,6 @@ class MainWindow(QMainWindow):
         self._unit = self._combo_unit.currentText()
         self._decimals = self._spin_decimals.value()
         self._ui_interval_ms = self._spin_ui_interval.value()
-
-        # 只影响UI刷新，不影响底层数据源
         self._ui_timer.setInterval(self._ui_interval_ms)
         self.refresh_ui()
 
@@ -675,15 +753,15 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
     def format_value(self, value: float) -> str:
+        """根据单位和小数位格式化数值"""
         factor = self.UNIT_FACTORS.get(self._unit, 1.0)
         converted = value * factor
         return f"{converted:.{self._decimals}f}"
 
-    # ---------------- 任务12：串口字节读取 ----------------
+    # ========== 串口字节读取 ==========
     @pyqtSlot()
     def on_refresh_ports_clicked(self) -> None:
         self._combo_ports.clear()
-
         if not SERIAL_AVAILABLE:
             return
 
@@ -691,31 +769,23 @@ class MainWindow(QMainWindow):
         if not ports:
             self._combo_ports.addItem("无可用串口")
             self._btn_serial_open.setEnabled(False)
-            self.append_log("[提示] 未发现可用串口。")
             return
 
         self._combo_ports.addItems(ports)
         self._btn_serial_open.setEnabled(True)
-        self.append_log(f"[串口] 已刷新，发现 {len(ports)} 个端口。")
 
     @pyqtSlot()
     def on_serial_open_clicked(self) -> None:
-        if self._serial_thread is not None:
-            return
-
-        if not SERIAL_AVAILABLE:
-            self.append_log("[错误] pyserial 不可用，无法打开串口。")
+        if self._serial_thread is not None or not SERIAL_AVAILABLE:
             return
 
         port = self._combo_ports.currentText().strip()
         if not port or port == "无可用串口":
-            self.append_log("[错误] 请先选择有效串口。")
             return
 
         try:
             baudrate = int(self._combo_baud.currentText())
         except ValueError:
-            self.append_log("[错误] 波特率非法。")
             return
 
         self._serial_thread = QThread()
@@ -732,10 +802,6 @@ class MainWindow(QMainWindow):
         self._serial_thread.finished.connect(self.on_serial_thread_finished)
 
         self._serial_rx_total = 0
-        self._serial_rx_last = 0
-        self._serial_last_preview_ts = 0.0
-        self._serial_rx_label.setText("RX: 0 bytes")
-
         self._btn_serial_open.setEnabled(False)
         self._btn_serial_close.setEnabled(True)
         self._btn_refresh_ports.setEnabled(False)
@@ -746,29 +812,19 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def on_serial_close_clicked(self) -> None:
-        self.append_log("[串口] 正在关闭...")
         self.stop_serial_worker()
 
     @pyqtSlot(bytes)
     def on_serial_bytes_received(self, data: bytes) -> None:
-        # 上层拿到原始bytes（暂不解析）
         self._serial_rx_total += len(data)
-        self._serial_rx_label.setText(f"RX: {self._serial_rx_total} bytes")
-
-        # 控制日志频率：每秒最多打一条预览
-        now = time.time()
-        if now - self._serial_last_preview_ts >= 1.0:
-            self._serial_last_preview_ts = now
-            preview = data[:16].hex(" ")
-            self.append_log(f"[串口RX] +{len(data)} bytes, preview: {preview}")
 
     @pyqtSlot(str)
     def on_serial_log_message(self, text: str) -> None:
-        self.append_log(text)
+        _ = text  # 当前界面不展开日志
 
     @pyqtSlot(str)
     def on_serial_status_changed(self, text: str) -> None:
-        self._serial_status.setText(text)
+        self._serial_state_text = text
 
     @pyqtSlot()
     def on_serial_thread_finished(self) -> None:
@@ -781,30 +837,57 @@ class MainWindow(QMainWindow):
         self._combo_ports.setEnabled(True)
         self._combo_baud.setEnabled(True)
 
-        self._serial_status.setText("串口：未打开")
-
     def stop_serial_worker(self) -> None:
         if self._serial_worker is not None:
             self._serial_worker.stop()
-
         if self._serial_thread is not None:
             self._serial_thread.quit()
             self._serial_thread.wait()
 
-    # ---------------- UI 刷新 ----------------
+    # ========== UI 刷新 ==========
     def refresh_ui(self) -> None:
+        """
+        主 UI 刷新循环（20Hz）：
+        - 更新热力图
+        - 更新统计数值
+        - 更新曲线图
+        - 更新状态栏
+        """
         if not self._connected or self._latest_frame is None:
+            self._statusbar.showMessage(
+                f"设备: 未连接 | UI采样率: {self._ui_fps:.1f} Hz | 串口: {self._serial_state_text}"
+            )
             return
 
         frame = self._latest_frame
         matrix = frame.matrix
         self._heatmap.set_matrix(matrix)
 
+        # 计算统计量
         total_raw = float(np.sum(matrix))
-        vmax_raw = float(np.max(matrix))
-        vmin_raw = float(np.min(matrix))
-        mean_raw = float(np.mean(matrix))
+        current_raw = float(np.max(matrix))  # 当前压力值定义为瞬时峰值
 
+        self._session_max = max(self._session_max, current_raw)
+        self._session_min = min(self._session_min, current_raw)
+
+        # 累积历史数据
+        t = time.time() - self._t0
+        self._time_hist.append(t)
+        self._total_hist.append(total_raw)
+        self._current_hist.append(current_raw)
+
+        # 更新曲线
+        self._curve_total.setData(list(self._time_hist), list(self._total_hist))
+        self._curve_current.setData(list(self._time_hist), list(self._current_hist))
+        self.apply_plot_time_window()
+
+        # 更新数值标签
+        self._val_total.setText(f"{self.format_value(total_raw)} {self._unit}")
+        self._val_current.setText(f"{self.format_value(current_raw)} {self._unit}")
+        self._val_max.setText(f"{self.format_value(self._session_max)} {self._unit}")
+        self._val_min.setText(f"{self.format_value(self._session_min)} {self._unit}")
+
+        # 计算 UI 采样率
         now = time.time()
         if self._last_ui_time is not None:
             dt = now - self._last_ui_time
@@ -812,14 +895,10 @@ class MainWindow(QMainWindow):
                 self._ui_fps = 1.0 / dt
         self._last_ui_time = now
 
-        self._stats.setText(
-            f"sum: {self.format_value(total_raw)} {self._unit} | "
-            f"max: {self.format_value(vmax_raw)} {self._unit} | "
-            f"min: {self.format_value(vmin_raw)} {self._unit} | "
-            f"mean: {self.format_value(mean_raw)} {self._unit} | "
-            f"UI_fps: {self._ui_fps:.1f} | 场景: {frame.scenario}"
+        # 单行状态栏：关键信息
+        self._statusbar.showMessage(
+            f"设备: 已连接 | UI采样率: {self._ui_fps:.1f} Hz | 串口RX: {self._serial_rx_total} bytes | 串口: {self._serial_state_text}"
         )
-        self._status.setText(f"状态：已连接 | 已收帧 {self._frame_count} | 最新帧 {frame.index}")
 
     def closeEvent(self, event) -> None:
         self.stop_worker()
@@ -829,6 +908,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True)
     window = MainWindow()
     window.show()
     return app.exec()
