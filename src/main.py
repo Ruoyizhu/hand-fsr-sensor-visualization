@@ -554,7 +554,7 @@ class MainWindow(QMainWindow):
 
         # 时间窗口选择
         self._combo_time_window = QComboBox()
-        self._combo_time_window.addItems(["10 s", "30 s", "60 s"])
+        self._combo_time_window.addItems(["10 s", "30 s", "60 s","All"])
         self._combo_time_window.setCurrentText("30 s")
 
         tw_bar = QHBoxLayout()
@@ -651,28 +651,38 @@ class MainWindow(QMainWindow):
         plot.setLabel("left", color="#000000")
         plot.setLabel("bottom", "Time(s)", color="#000000")
 
-    def _get_time_window_seconds(self) -> float:
-        """根据选择的时间窗返回秒数"""
+    def _get_time_window_seconds(self) -> Optional[float]:
+        """根据选择的时间窗返回秒数；“截至当前”返回 None。"""
         text = self._combo_time_window.currentText().strip()
         if text.startswith("10"):
             return 10.0
         if text.startswith("60"):
             return 60.0
+        if text.startswith("截至当前"):
+            return None
         return 30.0
 
     def apply_plot_time_window(self) -> None:
-        """应用时间窗口范围到两条曲线图"""
+        """应用时间窗口范围到两条曲线图。"""
         if len(self._time_hist) == 0:
             window = self._get_time_window_seconds()
+            if window is None:
+                window = 30.0
             self._plot_total.setXRange(0, window, padding=0.0)
             self._plot_current.setXRange(0, window, padding=0.0)
             return
 
         window = self._get_time_window_seconds()
         t_end = self._time_hist[-1]
-        t_start = max(0.0, t_end - window)
+
+        if window is None:
+            t_start = 0.0
+        else:
+            t_start = max(0.0, t_end - window)
+
         self._plot_total.setXRange(t_start, t_end, padding=0.0)
         self._plot_current.setXRange(t_start, t_end, padding=0.0)
+
 
     # ========== Mock 逻辑 ==========
     @pyqtSlot()
