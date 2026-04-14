@@ -523,10 +523,10 @@ class MainWindow(QMainWindow):
         metrics_grid.setHorizontalSpacing(12)
         metrics_grid.setVerticalSpacing(8)
 
-        lbl_total_name = QLabel("压力总值")
-        lbl_current_name = QLabel("当前压力值")
-        lbl_max_name = QLabel("会话最大值")
-        lbl_min_name = QLabel("会话最小值")
+        lbl_total_name = QLabel("Sum_force")
+        lbl_current_name = QLabel("Current_force")
+        lbl_max_name = QLabel("Max")
+        lbl_min_name = QLabel("Min")
 
         for lbl in [lbl_total_name, lbl_current_name, lbl_max_name, lbl_min_name]:
             lbl.setFont(data_font)

@@ -1,0 +1,16 @@
+{
+  "capture_start": "2026-04-14T15:21:32",
+  "capture_end": "2026-04-14T15:23:36",
+  "duration_s": 123.841,
+  "port": "COM5",
+  "baudrate": 9600,
+  "bytesize": 8,
+  "parity": "N",
+  "stopbits": 1.0,
+  "timeout": 0.2,
+  "encoding": "gbk",
+  "total_bytes": 114690,
+  "total_lines": 750,
+  "estimated_frames_16lines": 46.875,
+  "note": "Each line format: <iso_timestamp>\\t<raw_text_line>"
+}
