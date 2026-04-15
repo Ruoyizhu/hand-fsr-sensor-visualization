@@ -1,6 +1,5 @@
 import codecs
 import re
-import signal
 import sys
 import time
 from collections import deque
@@ -11,7 +10,7 @@ from typing import List, Optional
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QObject, QSettings, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QPainter, QPen, QPalette, QFont
+from PyQt6.QtGui import QColor, QPainter, QPen, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -27,7 +26,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-# 串口依赖（可选）
 try:
     import serial
     import serial.tools.list_ports
@@ -57,76 +55,86 @@ class ParserStats:
 _FLOAT_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
 
 
-# ============ 工具函数：从日志读取传感器数据范围 ============
-def load_sensor_range_from_logs(log_dir: str = "logs") -> tuple[float, float]:
-    """
-    【修复1】扫描日志文件夹，提取传感器数据的历史最小值和最大值
-    用于初始化热力图的合理显示范围
-    
-    参数:
-        log_dir: 日志文件夹路径
-    
-    返回:
-        (min_value, max_value) 元组
-    """
-    log_path = Path(log_dir)
-    if not log_path.exists():
-        # 若日志文件夹不存在，返回默认范围
-        return 0.0, 300.0
-    
-    vmin = float("inf")
-    vmax = float("-inf")
-    
-    # 扫描所有 .log 文件
-    for log_file in log_path.glob("*.log"):
+def _candidate_log_dirs(log_dir: str = "logs") -> List[Path]:
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path(log_dir),
+        script_dir / log_dir,
+        script_dir / "logs",
+        script_dir.parent / "logs",
+        script_dir.parent / "src" / "logs",
+    ]
+
+    result: List[Path] = []
+    seen = set()
+    for p in candidates:
         try:
-            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    # 日志格式: timestamp\trow_num float0 float1...
-                    if "\t" not in line:
-                        continue
-                    parts = line.split("\t", 1)
-                    if len(parts) < 2:
-                        continue
-                    
-                    payload = parts[1]
-                    # 提取所有浮点数
-                    nums = []
-                    for match in _FLOAT_RE.finditer(payload):
-                        try:
-                            nums.append(float(match.group()))
-                        except ValueError:
-                            pass
-                    
-                    # 跳过行号，只取16个值
-                    if len(nums) >= 16:
-                        # 若首个数是行号（1-16），则从索引1开始
-                        if len(nums) == 17:
-                            data_values = nums[1:17]
-                        else:
-                            data_values = nums[:16]
-                        
-                        for val in data_values:
-                            vmin = min(vmin, val)
-                            vmax = max(vmax, val)
+            rp = p.resolve()
         except Exception:
-            pass
-    
-    # 若没有读到任何数据，返回默认范围
-    if vmin == float("inf") or vmax == float("-inf"):
+            rp = p
+        key = str(rp)
+        if key not in seen and rp.exists() and rp.is_dir():
+            seen.add(key)
+            result.append(rp)
+    return result
+
+
+def load_sensor_mapping_from_logs(log_dir: str = "logs") -> tuple[float, float]:
+    """
+    从历史日志估计原始量程，返回 (raw_min, raw_max)。
+    使用分位数，降低极端值影响。
+    """
+    values: List[float] = []
+
+    for root in _candidate_log_dirs(log_dir):
+        for log_file in root.glob("*.log"):
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "\t" not in line:
+                            continue
+                        payload = line.split("\t", 1)[1]
+                        nums_str = _FLOAT_RE.findall(payload)
+                        if len(nums_str) < 16:
+                            continue
+
+                        nums: List[float] = []
+                        for s in nums_str:
+                            try:
+                                nums.append(float(s))
+                            except ValueError:
+                                pass
+
+                        if len(nums) == 17:
+                            row = nums[1:17]
+                        elif len(nums) >= 16:
+                            row = nums[:16]
+                        else:
+                            continue
+
+                        # 硬件故障补偿：第3列 <- 第4列
+                        row[2] = row[3]
+
+                        values.extend(row)
+            except Exception:
+                pass
+
+    if not values:
         return 0.0, 300.0
-    
-    # 返回 [min, max*1.1] 以留出余量
-    return float(vmin), float(max(vmax * 1.1, 100.0))
+
+    arr = np.asarray(values, dtype=np.float32)
+    p2 = float(np.percentile(arr, 2))
+    p98 = float(np.percentile(arr, 98))
+
+    raw_min = max(0.0, p2)
+    raw_max = max(raw_min + 1.0, p98 * 1.1)
+    return raw_min, raw_max
 
 
 class TextFrameParser:
     """
-    文本流 -> 16x16 矩阵 的流式解析器
-    - 支持半行/粘包
-    - 支持 \n 和 \r\n
-    - 行内稳健提取 float
-    - 默认兼容"行号 + 16个浮点数"的格式
+    文本流 -> 16x16矩阵
+    支持半行/粘包、行号+16值格式、坏行丢弃重同步。
     """
 
     def __init__(
@@ -173,20 +181,6 @@ class TextFrameParser:
 
         return frames
 
-    def flush(self) -> List[np.ndarray]:
-        frames: List[np.ndarray] = []
-        tail = self._decoder.decode(b"", final=True)
-        if tail:
-            self._text_buffer += tail
-
-        while "\n" in self._text_buffer:
-            raw_line, self._text_buffer = self._text_buffer.split("\n", 1)
-            line = raw_line.rstrip("\r")
-            self._consume_line(line, frames)
-
-        self._text_buffer = ""
-        return frames
-
     def _consume_line(self, line: str, out_frames: List[np.ndarray]) -> None:
         if not line.strip():
             return
@@ -195,7 +189,6 @@ class TextFrameParser:
         if row is None:
             self.stats.dropped_lines += 1
             self._consecutive_errors += 1
-
             if self._consecutive_errors >= self.max_consecutive_errors:
                 self._row_buffer.clear()
                 self._consecutive_errors = 0
@@ -242,8 +235,6 @@ class TextFrameParser:
 
 
 class SerialByteSource:
-    """串口字节源（只读 bytes，不解析）"""
-
     def __init__(self) -> None:
         self._ser = None
 
@@ -253,7 +244,7 @@ class SerialByteSource:
             return []
         return [p.device for p in serial.tools.list_ports.comports()]
 
-    def open(self, port: str, baudrate: int, timeout: float = 0.2) -> None:
+    def open(self, port: str, baudrate: int, timeout: float = 0.02) -> None:
         if not SERIAL_AVAILABLE:
             raise RuntimeError("pyserial 未安装")
         self._ser = serial.Serial(
@@ -274,7 +265,7 @@ class SerialByteSource:
     def is_open(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
-    def read_bytes(self, max_bytes: int = 1024) -> bytes:
+    def read_bytes(self, max_bytes: int = 2048) -> bytes:
         if not self.is_open():
             return b""
         waiting = self._ser.in_waiting if self._ser is not None else 0
@@ -285,11 +276,10 @@ class SerialByteSource:
 class SerialWorker(QObject):
     bytes_received = pyqtSignal(bytes)
     frame_received = pyqtSignal(object)
-    log_message = pyqtSignal(str)
     status_changed = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, port: str, baudrate: int, timeout: float = 0.2) -> None:
+    def __init__(self, port: str, baudrate: int, timeout: float = 0.02) -> None:
         super().__init__()
         self._running = False
         self._port = port
@@ -305,21 +295,15 @@ class SerialWorker(QObject):
             allow_leading_index=True,
         )
         self._frame_index = 0
-        self._last_timeout_log_ts = 0.0
-        self._read_cycle_count = 0
-        self._last_parser_stats = None
 
     @pyqtSlot()
     def run(self) -> None:
         self._running = True
-
         try:
             self._source.open(self._port, self._baudrate, self._timeout)
             self.status_changed.emit("已打开")
-            self.log_message.emit(f"串口已打开: {self._port}@{self._baudrate} | 编码: UTF-8")
-        except Exception as e:
+        except Exception:
             self.status_changed.emit("打开失败")
-            self.log_message.emit(f"[错误] 串口打开失败: {e}")
             self.finished.emit()
             return
 
@@ -327,42 +311,31 @@ class SerialWorker(QObject):
             while self._running:
                 try:
                     data = self._source.read_bytes(max_bytes=2048)
-                except Exception as e:
-                    self.log_message.emit(f"[错误] 串口读取异常(可能拔插): {e}")
+                except Exception:
                     self.status_changed.emit("读取异常")
                     break
 
-                if data:
-                    self.bytes_received.emit(data)
-                    matrices = self._parser.feed(data)
-                    for matrix in matrices:
-                        frame = Frame(
-                            timestamp=time.time(),
-                            index=self._frame_index,
-                            matrix=matrix,
-                            scenario="sensor",
-                        )
-                        self._frame_index += 1
-                        self.frame_received.emit(frame)
+                if not data:
+                    continue
 
-                    self._read_cycle_count += 1
-                    if self._read_cycle_count % 100 == 0:
-                        stats = self._parser.stats
-                        if self._last_parser_stats is None or (
-                            stats.emitted_frames != self._last_parser_stats.emitted_frames
-                        ):
-                            self.log_message.emit(
-                                f"[解析] frames={stats.emitted_frames} "
-                                f"rows={stats.accepted_rows} "
-                                f"dropped={stats.dropped_lines} "
-                                f"resync={stats.resync_count}"
-                            )
-                            self._last_parser_stats = stats
-                else:
-                    now = time.time()
-                    if now - self._last_timeout_log_ts >= 2.0:
-                        self._last_timeout_log_ts = now
-                        self.log_message.emit("[提示] 串口读取超时（可能无数据）")
+                self.bytes_received.emit(data)
+
+                # 关键降延迟：同一批只发最新一帧，避免UI队列堆积
+                matrices = self._parser.feed(data)
+                if not matrices:
+                    continue
+
+                last_mat = matrices[-1]
+                # 补齐索引：中间帧视为丢弃，但计数前移
+                self._frame_index += len(matrices) - 1
+                frame = Frame(
+                    timestamp=time.time(),
+                    index=self._frame_index,
+                    matrix=last_mat,
+                    scenario="sensor",
+                )
+                self._frame_index += 1
+                self.frame_received.emit(frame)
         finally:
             try:
                 self._source.close()
@@ -377,23 +350,14 @@ class SerialWorker(QObject):
 
 
 class HeatmapGridWidget(QWidget):
-    """
-    16x16 自定义热力图网格：
-    - 单元严格正方形
-    - 间隙可配置
-    - 自适应窗口尺寸
-    - 背景：系统默认色
-    """
-
     def __init__(self, rows: int = 16, cols: int = 16, gap_px: int = 2) -> None:
         super().__init__()
         self.rows = rows
         self.cols = cols
         self.gap_px = gap_px
         self.margin_px = 12
-        # 【修复1】初始化为合理范围，而不是 0-10
         self.vmin = 0.0
-        self.vmax = 300.0
+        self.vmax = 20.0
         self._matrix = np.zeros((rows, cols), dtype=np.float32)
         self._lut = self._build_jet_lut()
         self.setMinimumSize(360, 360)
@@ -410,9 +374,8 @@ class HeatmapGridWidget(QWidget):
         self.update()
 
     def set_vrange(self, vmin: float, vmax: float) -> None:
-        """【修复2】动态设置色彩范围 - 支持用户手动调整"""
         self.vmin = float(vmin)
-        self.vmax = max(self.vmin + 0.5, float(vmax))
+        self.vmax = max(self.vmin + 0.1, float(vmax))
         self.update()
 
     def _build_jet_lut(self) -> np.ndarray:
@@ -428,7 +391,6 @@ class HeatmapGridWidget(QWidget):
         x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
         xp = np.array([p for p, _ in anchors], dtype=np.float32)
         rgb = np.array([c for _, c in anchors], dtype=np.float32)
-
         lut = np.zeros((256, 3), dtype=np.uint8)
         for k in range(3):
             lut[:, k] = np.interp(x, xp, rgb[:, k]).astype(np.uint8)
@@ -445,17 +407,12 @@ class HeatmapGridWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
-        bg = self.palette().color(QPalette.ColorRole.Window)
-        painter.fillRect(self.rect(), bg)
+        painter.fillRect(self.rect(), self.palette().window())
 
-        w = self.width()
-        h = self.height()
-        gap = self.gap_px
-        margin = self.margin_px
-
+        w, h = self.width(), self.height()
+        gap, margin = self.gap_px, self.margin_px
         avail_w = max(1, w - 2 * margin - (self.cols - 1) * gap)
         avail_h = max(1, h - 2 * margin - (self.rows - 1) * gap)
-
         cell = max(1, int(min(avail_w / self.cols, avail_h / self.rows)))
 
         grid_w = cell * self.cols + gap * (self.cols - 1)
@@ -466,39 +423,35 @@ class HeatmapGridWidget(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         for r in range(self.rows):
             for c in range(self.cols):
-                val = float(self._matrix[r, c])
-                painter.setBrush(self._value_to_color(val))
+                v = float(self._matrix[r, c])
+                painter.setBrush(self._value_to_color(v))
                 x = x0 + c * (cell + gap)
                 y = y0 + r * (cell + gap)
                 painter.drawRect(x, y, cell, cell)
 
-        border_pen = QPen(QColor(120, 120, 120, 120))
-        border_pen.setWidth(1)
-        painter.setPen(border_pen)
+        pen = QPen(QColor(120, 120, 120, 120))
+        pen.setWidth(1)
+        painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(x0 - 1, y0 - 1, grid_w + 2, grid_h + 2)
 
 
 class MainWindow(QMainWindow):
-    """
-    主窗口布局：
-    - 顶部：串口与显示控制 + 【修复2】阈值调整控件
-    - 中间：左右并列（左：热力图，右：数据分析）
-    - 底部：单行状态栏
-    """
-
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Hand FSR Demo - Sensor Mode")
+        self.setWindowTitle("Hand FSR Demo")
         self.resize(1500, 900)
 
         self._settings = QSettings("NJIT", "HandFSR")
 
         self._serial_thread: Optional[QThread] = None
         self._serial_worker: Optional[SerialWorker] = None
-        self._serial_is_running = False
+        self._stream_active = False
 
+        self._pending_frame: Optional[Frame] = None
+        self._has_pending_frame = False
         self._latest_frame: Optional[Frame] = None
+
         self._frame_count = 0
         self._data_fps = 0.0
         self._last_frame_arrival_time: Optional[float] = None
@@ -511,29 +464,35 @@ class MainWindow(QMainWindow):
         self._session_max = float("-inf")
         self._session_min = float("inf")
 
-        self._t0 = time.time()
         self._time_hist = deque(maxlen=2400)
         self._total_hist = deque(maxlen=2400)
         self._current_hist = deque(maxlen=2400)
+        self._plot_t0_sensor_ts: Optional[float] = None
 
         self._decimals = self._settings.value("display/decimals", 1, type=int)
-        self._ui_interval_ms = self._settings.value("display/ui_interval_ms", 50, type=int)
-
-        self._data_source_text = "传感器"
+        self._ui_interval_ms = self._settings.value("display/ui_interval_ms", 33, type=int)
         self._unit_text = "N"
 
-        # 【修复1】从日志读取历史范围
-        hist_vmin, hist_vmax = load_sensor_range_from_logs("logs")
+        # 映射参数：原始 -> 0..20N
+        self._raw_min, self._raw_max = load_sensor_mapping_from_logs("logs")
+        self._force_max_n = 20.0
 
-        # ========== 顶部控制栏（扩展版）==========
+        # 自动标定参数
+        self._zero_offset = np.zeros((16, 16), dtype=np.float32)
+        self._calib_sum = np.zeros((16, 16), dtype=np.float64)
+        self._calib_count = 0
+        self._calib_active = False
+        self._calib_need_frames = 10
+
+        # 控件
         self._btn_refresh_ports = QPushButton("刷新串口")
         self._combo_ports = QComboBox()
         self._combo_baud = QComboBox()
-        self._combo_baud.addItems(["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"])
+        self._combo_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
         self._combo_baud.setCurrentText("9600")
-        self._btn_serial_open = QPushButton("打开串口")
-        self._btn_serial_close = QPushButton("关闭串口")
-        self._btn_serial_close.setEnabled(False)
+        self._btn_open = QPushButton("打开串口")
+        self._btn_close = QPushButton("关闭串口")
+        self._btn_close.setEnabled(False)
 
         self._spin_gap = QSpinBox()
         self._spin_gap.setRange(0, 8)
@@ -544,31 +503,55 @@ class MainWindow(QMainWindow):
         self._spin_decimals.setValue(max(0, min(6, int(self._decimals))))
 
         self._spin_ui_interval = QSpinBox()
-        self._spin_ui_interval.setRange(20, 100)
-        self._spin_ui_interval.setValue(max(16, min(100, int(self._ui_interval_ms))))
+        self._spin_ui_interval.setRange(10, 100)
+        self._spin_ui_interval.setValue(max(10, min(100, int(self._ui_interval_ms))))
         self._spin_ui_interval.setSuffix(" ms")
 
-        # 【修复2】添加热力图阈值调整控件
+        # 热力图阈值手动调节
+        saved_vmin = self._settings.value("display/vmin", 0.0, type=float)
+        saved_vmax = self._settings.value("display/vmax", 20.0, type=float)
+
         self._spin_vmin = QDoubleSpinBox()
-        self._spin_vmin.setRange(-100.0, 1000.0)
-        self._spin_vmin.setValue(hist_vmin)
-        self._spin_vmin.setSingleStep(5.0)
-        self._spin_vmin.setDecimals(1)
+        self._spin_vmin.setRange(0.0, 100.0)
+        self._spin_vmin.setDecimals(2)
+        self._spin_vmin.setSingleStep(0.5)
+        self._spin_vmin.setValue(saved_vmin)
 
         self._spin_vmax = QDoubleSpinBox()
-        self._spin_vmax.setRange(0.0, 1000.0)
-        self._spin_vmax.setValue(hist_vmax)
-        self._spin_vmax.setSingleStep(5.0)
-        self._spin_vmax.setDecimals(1)
+        self._spin_vmax.setRange(0.1, 100.0)
+        self._spin_vmax.setDecimals(2)
+        self._spin_vmax.setSingleStep(0.5)
+        self._spin_vmax.setValue(saved_vmax)
 
+        self._heatmap = HeatmapGridWidget(rows=16, cols=16, gap_px=2)
+        self._heatmap.set_vrange(self._spin_vmin.value(), self._spin_vmax.value())
+
+        self._plot_total = pg.PlotWidget(title="总力 - 时间")
+        self._plot_current = pg.PlotWidget(title="峰值 - 时间")
+        self._setup_plot(self._plot_total)
+        self._setup_plot(self._plot_current)
+        self._curve_total = self._plot_total.plot([], [], pen=pg.mkPen("k", width=2))
+        self._curve_current = self._plot_current.plot([], [], pen=pg.mkPen("k", width=2, style=Qt.PenStyle.DashLine))
+
+        self._combo_time_window = QComboBox()
+        self._combo_time_window.addItems(["10 s", "30 s", "60 s", "截至当前"])
+        self._combo_time_window.setCurrentText("30 s")
+
+        self._val_total = QLabel("0.0 N")
+        self._val_current = QLabel("0.0 N")
+        self._val_max = QLabel("-")
+        self._val_min = QLabel("-")
+        self._make_value_labels()
+
+        # 布局
         controls = QHBoxLayout()
         controls.addWidget(self._btn_refresh_ports)
         controls.addWidget(QLabel("端口"))
         controls.addWidget(self._combo_ports)
         controls.addWidget(QLabel("波特率"))
         controls.addWidget(self._combo_baud)
-        controls.addWidget(self._btn_serial_open)
-        controls.addWidget(self._btn_serial_close)
+        controls.addWidget(self._btn_open)
+        controls.addWidget(self._btn_close)
         controls.addSpacing(12)
         controls.addWidget(QLabel("间隙"))
         controls.addWidget(self._spin_gap)
@@ -576,220 +559,187 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._spin_decimals)
         controls.addWidget(QLabel("刷新"))
         controls.addWidget(self._spin_ui_interval)
-        # 【修复2】添加热力图范围标签和控件
         controls.addWidget(QLabel("热力Min"))
         controls.addWidget(self._spin_vmin)
         controls.addWidget(QLabel("Max"))
         controls.addWidget(self._spin_vmax)
-        controls.addWidget(QLabel("单位"))
-        controls.addWidget(QLabel("N"))
+        controls.addWidget(QLabel("单位 N"))
         controls.addStretch()
 
-        # ========== 左栏：热力图 ==========
-        self._heatmap = HeatmapGridWidget(rows=16, cols=16, gap_px=2)
-        # 【修复1】使用历史范围初始化热力图
-        self._heatmap.set_vrange(hist_vmin, hist_vmax)
-
+        left = QVBoxLayout()
         left_title = QLabel("热力图（传感器）")
-        left_title_font = QFont()
-        left_title_font.setPointSize(11)
-        left_title_font.setBold(True)
-        left_title.setFont(left_title_font)
+        f = QFont()
+        f.setBold(True)
+        f.setPointSize(11)
+        left_title.setFont(f)
+        left.addWidget(left_title)
+        left.addWidget(self._heatmap, stretch=1)
+        left_w = QWidget()
+        left_w.setLayout(left)
 
-        left_panel = QVBoxLayout()
-        left_panel.addWidget(left_title)
-        left_panel.addWidget(self._heatmap, stretch=1)
-        left_panel.setContentsMargins(8, 8, 8, 8)
-        left_widget = QWidget()
-        left_widget.setLayout(left_panel)
+        metrics = QGridLayout()
+        metrics.addWidget(QLabel("总力 (N)"), 0, 0)
+        metrics.addWidget(self._val_total, 0, 1)
+        metrics.addWidget(QLabel("当前峰值 (N)"), 1, 0)
+        metrics.addWidget(self._val_current, 1, 1)
+        metrics.addWidget(QLabel("会话最大 (N)"), 2, 0)
+        metrics.addWidget(self._val_max, 2, 1)
+        metrics.addWidget(QLabel("会话最小 (N)"), 3, 0)
+        metrics.addWidget(self._val_min, 3, 1)
 
-        # ========== 右栏：数据分析 ==========
-        title_font = QFont()
-        title_font.setPointSize(11)
-        title_font.setBold(True)
+        tw = QHBoxLayout()
+        tw.addWidget(QLabel("时间窗"))
+        tw.addWidget(self._combo_time_window)
+        tw.addStretch()
 
-        data_font = QFont()
-        data_font.setPointSize(10)
-
-        value_font = QFont()
-        value_font.setPointSize(12)
-        value_font.setBold(True)
-
+        right = QVBoxLayout()
         right_title = QLabel("实时数据分析")
-        right_title.setFont(title_font)
+        right_title.setFont(f)
+        right.addWidget(right_title)
+        right.addLayout(metrics)
+        right.addLayout(tw)
+        right.addWidget(self._plot_total, stretch=1)
+        right.addWidget(self._plot_current, stretch=1)
+        right_w = QWidget()
+        right_w.setLayout(right)
 
-        metrics_grid = QGridLayout()
-        metrics_grid.setHorizontalSpacing(12)
-        metrics_grid.setVerticalSpacing(8)
+        work = QHBoxLayout()
+        work.addWidget(left_w, stretch=3)
+        work.addWidget(right_w, stretch=2)
 
-        lbl_total_name = QLabel("总力 (N)")
-        lbl_current_name = QLabel("当前峰值 (N)")
-        lbl_max_name = QLabel("会话最大 (N)")
-        lbl_min_name = QLabel("会话最小 (N)")
-
-        for lbl in [lbl_total_name, lbl_current_name, lbl_max_name, lbl_min_name]:
-            lbl.setFont(data_font)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        self._val_total = QLabel("0.0 N")
-        self._val_current = QLabel("0.0 N")
-        self._val_max = QLabel("-")
-        self._val_min = QLabel("-")
-
-        for val in [self._val_total, self._val_current, self._val_max, self._val_min]:
-            val.setFont(value_font)
-            val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            val.setStyleSheet("QLabel { background: white; border: 1px solid #BFBFBF; padding: 4px 8px; }")
-            val.setMinimumWidth(140)
-
-        metrics_grid.addWidget(lbl_total_name, 0, 0)
-        metrics_grid.addWidget(self._val_total, 0, 1)
-        metrics_grid.addWidget(lbl_current_name, 1, 0)
-        metrics_grid.addWidget(self._val_current, 1, 1)
-        metrics_grid.addWidget(lbl_max_name, 2, 0)
-        metrics_grid.addWidget(self._val_max, 2, 1)
-        metrics_grid.addWidget(lbl_min_name, 3, 0)
-        metrics_grid.addWidget(self._val_min, 3, 1)
-
-        self._combo_time_window = QComboBox()
-        self._combo_time_window.addItems(["10 s", "30 s", "60 s", "截至当前"])
-        self._combo_time_window.setCurrentText("30 s")
-
-        tw_bar = QHBoxLayout()
-        tw_bar.addWidget(QLabel("时间窗"))
-        tw_bar.addWidget(self._combo_time_window)
-        tw_bar.addStretch()
-
-        self._plot_total = pg.PlotWidget(title="总力 - 时间")
-        self._setup_white_black_plot(self._plot_total)
-        self._curve_total = self._plot_total.plot([], [], pen=pg.mkPen("k", width=2))
-
-        self._plot_current = pg.PlotWidget(title="峰值 - 时间")
-        self._setup_white_black_plot(self._plot_current)
-        self._curve_current = self._plot_current.plot(
-            [], [], pen=pg.mkPen("k", width=2, style=Qt.PenStyle.DashLine)
-        )
-
-        right_panel = QVBoxLayout()
-        right_panel.addWidget(right_title)
-        right_panel.addLayout(metrics_grid)
-        right_panel.addLayout(tw_bar)
-        right_panel.addWidget(self._plot_total, stretch=1)
-        right_panel.addWidget(self._plot_current, stretch=1)
-        right_panel.setContentsMargins(8, 8, 8, 8)
-        right_widget = QWidget()
-        right_widget.setLayout(right_panel)
-
-        work_layout = QHBoxLayout()
-        work_layout.addWidget(left_widget, stretch=3)
-        work_layout.addWidget(right_widget, stretch=2)
-        work_layout.setContentsMargins(0, 0, 0, 0)
-
-        # ========== 底部状态栏 ==========
-        self._statusbar = QStatusBar(self)
-        self.setStatusBar(self._statusbar)
-        self._statusbar.showMessage("系统就绪 | 数据源: 传感器")
-
-        # ========== 主布局 ==========
         root = QVBoxLayout()
         root.addLayout(controls)
-        root.addLayout(work_layout, stretch=1)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
+        root.addLayout(work, stretch=1)
+        root_w = QWidget()
+        root_w.setLayout(root)
+        self.setCentralWidget(root_w)
 
-        central = QWidget()
-        central.setLayout(root)
-        self.setCentralWidget(central)
+        self._statusbar = QStatusBar(self)
+        self.setStatusBar(self._statusbar)
 
-        # ========== 信号连接 ==========
+        # 信号
         self._btn_refresh_ports.clicked.connect(self.on_refresh_ports_clicked)
-        self._btn_serial_open.clicked.connect(self.on_serial_open_clicked)
-        self._btn_serial_close.clicked.connect(self.on_serial_close_clicked)
+        self._btn_open.clicked.connect(self.on_open_clicked)
+        self._btn_close.clicked.connect(self.on_close_clicked)
         self._spin_gap.valueChanged.connect(self._heatmap.set_gap)
         self._spin_decimals.valueChanged.connect(self.on_display_settings_changed)
         self._spin_ui_interval.valueChanged.connect(self.on_display_settings_changed)
-        self._combo_time_window.currentTextChanged.connect(self.apply_plot_time_window)
-        # 【修复2】连接阈值控件信号
         self._spin_vmin.valueChanged.connect(self.on_vrange_changed)
         self._spin_vmax.valueChanged.connect(self.on_vrange_changed)
+        self._combo_time_window.currentTextChanged.connect(self.apply_plot_time_window)
 
-        # UI 刷新定时器
+        # 定时器：只负责“消费最新帧”和状态刷新
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(self._spin_ui_interval.value())
         self._ui_timer.timeout.connect(self.refresh_ui)
         self._ui_timer.start()
 
-        # 初始化
         self.apply_display_settings()
         self.on_refresh_ports_clicked()
         self.apply_plot_time_window()
+        self._update_status("系统就绪")
 
-        if not SERIAL_AVAILABLE:
-            self._statusbar.showMessage("系统就绪 | 数据源: 传感器 | 串口不可用(缺少 pyserial)")
+    def _make_value_labels(self) -> None:
+        for v in [self._val_total, self._val_current, self._val_max, self._val_min]:
+            v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            v.setStyleSheet("QLabel { background: white; border: 1px solid #BFBFBF; padding: 4px 8px; }")
+            v.setMinimumWidth(140)
 
-    def _setup_white_black_plot(self, plot: pg.PlotWidget) -> None:
+    def _setup_plot(self, plot: pg.PlotWidget) -> None:
         plot.setBackground("w")
         plot.showGrid(x=True, y=True, alpha=0.2)
-
-        axis_left = plot.getAxis("left")
-        axis_bottom = plot.getAxis("bottom")
-        axis_left.setPen(pg.mkPen("k", width=1))
-        axis_bottom.setPen(pg.mkPen("k", width=1))
-        axis_left.setTextPen(pg.mkPen("k"))
-        axis_bottom.setTextPen(pg.mkPen("k"))
-
-        plot.setLabel("left", color="#000000")
+        plot.setClipToView(True)
+        ax_l = plot.getAxis("left")
+        ax_b = plot.getAxis("bottom")
+        ax_l.setPen(pg.mkPen("k", width=1))
+        ax_b.setPen(pg.mkPen("k", width=1))
+        ax_l.setTextPen(pg.mkPen("k"))
+        ax_b.setTextPen(pg.mkPen("k"))
         plot.setLabel("bottom", "Time(s)", color="#000000")
 
+    def _update_status(self, prefix: str = "") -> None:
+        msg = (
+            f"{prefix} | 数据源: 传感器 | 状态: {self._serial_state_text} | "
+            f"已收帧: {self._frame_count} | 数据FPS: {self._data_fps:.1f} | "
+            f"UI FPS: {self._ui_fps:.1f} | 串口RX: {self._serial_rx_total} bytes"
+        )
+        self._statusbar.showMessage(msg)
+
     def _get_time_window_seconds(self) -> Optional[float]:
-        text = self._combo_time_window.currentText().strip()
-        if text.startswith("10"):
+        t = self._combo_time_window.currentText().strip()
+        if t.startswith("10"):
             return 10.0
-        if text.startswith("60"):
+        if t.startswith("60"):
             return 60.0
-        if text.startswith("截至当前"):
+        if t.startswith("截至当前"):
             return None
         return 30.0
 
     def apply_plot_time_window(self) -> None:
         if len(self._time_hist) == 0:
-            window = self._get_time_window_seconds()
-            if window is None:
-                window = 30.0
-            self._plot_total.setXRange(0, window, padding=0.0)
-            self._plot_current.setXRange(0, window, padding=0.0)
+            w = self._get_time_window_seconds()
+            if w is None:
+                w = 30.0
+            self._plot_total.setXRange(0, w, padding=0.0)
+            self._plot_current.setXRange(0, w, padding=0.0)
             return
 
-        window = self._get_time_window_seconds()
         t_end = self._time_hist[-1]
-
-        if window is None:
-            t_start = 0.0
-        else:
-            t_start = max(0.0, t_end - window)
-
+        w = self._get_time_window_seconds()
+        t_start = 0.0 if w is None else max(0.0, t_end - w)
         self._plot_total.setXRange(t_start, t_end, padding=0.0)
         self._plot_current.setXRange(t_start, t_end, padding=0.0)
+
+    def _build_correction(self, matrix: np.ndarray) -> np.ndarray:
+        # 硬件故障补偿：第3列 <- 第4列
+        out = matrix.astype(np.float32, copy=True)
+        if out.shape == (16, 16):
+            out[:, 2] = out[:, 3]
+        return out
+
+    def _apply_zero_offset(self, matrix: np.ndarray) -> np.ndarray:
+        out = matrix - self._zero_offset
+        return np.maximum(out, 0.0).astype(np.float32)
+
+    def _map_to_force_n(self, matrix: np.ndarray) -> np.ndarray:
+        span = max(1e-6, self._raw_max - self._raw_min)
+        norm = (matrix - self._raw_min) / span
+        norm = np.clip(norm, 0.0, 1.0)
+        mapped = norm * self._force_max_n
+        return mapped.astype(np.float32)
+
+    def _start_calibration(self) -> None:
+        self._calib_sum = np.zeros((16, 16), dtype=np.float64)
+        self._calib_count = 0
+        self._calib_active = True
+        self._zero_offset = np.zeros((16, 16), dtype=np.float32)
+        self._update_status("正在自动标定零点")
+
+    def _finish_calibration(self) -> None:
+        if self._calib_count > 0:
+            self._zero_offset = (self._calib_sum / float(self._calib_count)).astype(np.float32)
+        else:
+            self._zero_offset = np.zeros((16, 16), dtype=np.float32)
+        self._calib_active = False
+        self._update_status("标定完成")
 
     @pyqtSlot()
     def on_refresh_ports_clicked(self) -> None:
         self._combo_ports.clear()
         if not SERIAL_AVAILABLE:
             self._combo_ports.addItem("pyserial 未装")
-            self._btn_serial_open.setEnabled(False)
+            self._btn_open.setEnabled(False)
             return
-
         ports = SerialByteSource.list_ports()
         if not ports:
             self._combo_ports.addItem("无可用串口")
-            self._btn_serial_open.setEnabled(False)
+            self._btn_open.setEnabled(False)
             return
-
         self._combo_ports.addItems(ports)
-        self._btn_serial_open.setEnabled(True)
+        self._btn_open.setEnabled(True)
 
     @pyqtSlot()
-    def on_serial_open_clicked(self) -> None:
+    def on_open_clicked(self) -> None:
         if self._serial_thread is not None or not SERIAL_AVAILABLE:
             return
 
@@ -798,53 +748,65 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            baudrate = int(self._combo_baud.currentText())
+            baud = int(self._combo_baud.currentText())
         except ValueError:
             return
 
         self._serial_thread = QThread()
-        self._serial_worker = SerialWorker(port=port, baudrate=baudrate, timeout=0.2)
+        self._serial_worker = SerialWorker(port=port, baudrate=baud, timeout=0.02)
         self._serial_worker.moveToThread(self._serial_thread)
 
         self._serial_thread.started.connect(self._serial_worker.run)
         self._serial_worker.bytes_received.connect(self.on_serial_bytes_received)
         self._serial_worker.frame_received.connect(self.on_frame_received)
-        self._serial_worker.log_message.connect(self.on_serial_log_message)
         self._serial_worker.status_changed.connect(self.on_serial_status_changed)
         self._serial_worker.finished.connect(self._serial_thread.quit)
         self._serial_worker.finished.connect(self._serial_worker.deleteLater)
         self._serial_thread.finished.connect(self._serial_thread.deleteLater)
         self._serial_thread.finished.connect(self.on_serial_thread_finished)
 
-        # 【修复3】重置所有与数据相关的状态
+        # 重新开始采集
+        self._stream_active = True
         self._serial_rx_total = 0
         self._frame_count = 0
         self._data_fps = 0.0
         self._last_frame_arrival_time = None
+        self._ui_fps = 0.0
+        self._last_ui_time = None
         self._session_max = float("-inf")
         self._session_min = float("inf")
         self._time_hist.clear()
         self._total_hist.clear()
         self._current_hist.clear()
-        self._t0 = time.time()
-        self._latest_frame = None  # 清除之前的帧
-        self._serial_is_running = True
+        self._plot_t0_sensor_ts = None
+        self._pending_frame = None
+        self._has_pending_frame = False
+        self._latest_frame = None
 
-        self._btn_serial_open.setEnabled(False)
-        self._btn_serial_close.setEnabled(True)
+        # 自动零点标定
+        self._start_calibration()
+
+        self._btn_open.setEnabled(False)
+        self._btn_close.setEnabled(True)
         self._btn_refresh_ports.setEnabled(False)
         self._combo_ports.setEnabled(False)
         self._combo_baud.setEnabled(False)
 
-        self._statusbar.showMessage(f"系统就绪 | 数据源: {self._data_source_text} | 串口: 打开中...")
-
         self._serial_thread.start()
+        self._update_status("打开串口中")
 
     @pyqtSlot()
-    def on_serial_close_clicked(self) -> None:
-        # 【修复3】立即标记为运行停止，阻止新数据写入
-        self._serial_is_running = False
+    def on_close_clicked(self) -> None:
+        # 先关流开关，立即阻断后续帧进入
+        self._stream_active = False
+        self._calib_active = False
+        self._pending_frame = None
+        self._has_pending_frame = False
+
         self.stop_serial_worker()
+
+        # 关闭后冻结最后画面，不再延伸曲线
+        self._update_status("串口已关闭")
 
     @pyqtSlot(bytes)
     def on_serial_bytes_received(self, data: bytes) -> None:
@@ -852,21 +814,38 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(object)
     def on_frame_received(self, frame: object) -> None:
-        # 【修复3】只有当 _serial_is_running 为 True 时才接受帧
-        if isinstance(frame, Frame) and self._serial_is_running:
-            self._latest_frame = frame
-            self._frame_count += 1
+        if not self._stream_active:
+            return
+        if not isinstance(frame, Frame):
+            return
 
-            now = time.time()
-            if self._last_frame_arrival_time is not None:
-                dt = now - self._last_frame_arrival_time
-                if dt > 0:
-                    self._data_fps = 1.0 / dt
-            self._last_frame_arrival_time = now
+        now = time.time()
+        if self._last_frame_arrival_time is not None:
+            dt = now - self._last_frame_arrival_time
+            if dt > 0:
+                self._data_fps = 1.0 / dt
+        self._last_frame_arrival_time = now
 
-    @pyqtSlot(str)
-    def on_serial_log_message(self, text: str) -> None:
-        _ = text
+        corrected = self._build_correction(frame.matrix)
+
+        if self._calib_active:
+            self._calib_sum += corrected.astype(np.float64)
+            self._calib_count += 1
+            if self._calib_count >= self._calib_need_frames:
+                self._finish_calibration()
+            return
+
+        zero_fixed = self._apply_zero_offset(corrected)
+        mapped = self._map_to_force_n(zero_fixed)
+
+        # 最新帧覆盖旧帧，避免延迟累积
+        self._pending_frame = Frame(
+            timestamp=frame.timestamp,
+            index=frame.index,
+            matrix=mapped,
+            scenario="sensor",
+        )
+        self._has_pending_frame = True
 
     @pyqtSlot(str)
     def on_serial_status_changed(self, text: str) -> None:
@@ -876,20 +855,15 @@ class MainWindow(QMainWindow):
     def on_serial_thread_finished(self) -> None:
         self._serial_thread = None
         self._serial_worker = None
-        # 【修复3】确保已设置为 False（由 on_serial_close_clicked 设置）
-        self._serial_is_running = False
-        self._latest_frame = None  # 清除最后一帧
-
-        self._btn_serial_open.setEnabled(
+        self._btn_open.setEnabled(
             SERIAL_AVAILABLE and self._combo_ports.currentText() not in ("pyserial 未装", "无可用串口")
         )
-        self._btn_serial_close.setEnabled(False)
+        self._btn_close.setEnabled(False)
         self._btn_refresh_ports.setEnabled(SERIAL_AVAILABLE)
         self._combo_ports.setEnabled(True)
         self._combo_baud.setEnabled(True)
 
     def stop_serial_worker(self) -> None:
-        """【修复3】安全停止串口工作线程"""
         if self._serial_worker is not None:
             self._serial_worker.stop()
         if self._serial_thread is not None:
@@ -903,69 +877,65 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def on_vrange_changed(self) -> None:
-        """【修复2】热力图阈值改变时的处理"""
         vmin = self._spin_vmin.value()
         vmax = self._spin_vmax.value()
-        # 确保 vmin < vmax
         if vmin >= vmax:
-            vmax = vmin + 0.5
+            vmax = vmin + 0.1
             self._spin_vmax.blockSignals(True)
             self._spin_vmax.setValue(vmax)
             self._spin_vmax.blockSignals(False)
         self._heatmap.set_vrange(vmin, vmax)
+        self.save_display_settings()
 
     def apply_display_settings(self) -> None:
         self._decimals = self._spin_decimals.value()
         self._ui_interval_ms = self._spin_ui_interval.value()
         self._ui_timer.setInterval(self._ui_interval_ms)
-        self.refresh_ui()
 
     def save_display_settings(self) -> None:
         self._settings.setValue("display/decimals", self._decimals)
         self._settings.setValue("display/ui_interval_ms", self._ui_interval_ms)
+        self._settings.setValue("display/vmin", self._spin_vmin.value())
+        self._settings.setValue("display/vmax", self._spin_vmax.value())
         self._settings.sync()
 
-    def format_value(self, value: float) -> str:
-        return f"{value:.{self._decimals}f}"
+    def _fmt(self, v: float) -> str:
+        return f"{v:.{self._decimals}f}"
 
     def refresh_ui(self) -> None:
-        """【修复3】改进 UI 刷新逻辑，确保数据流完全停止"""
-        if not self._serial_state_text:
-            self._serial_state_text = "未打开"
+        if self._stream_active and self._has_pending_frame and self._pending_frame is not None:
+            frame = self._pending_frame
+            self._pending_frame = None
+            self._has_pending_frame = False
+            self._latest_frame = frame
 
-        # 【修复3】若串口已关闭且无最新帧，只更新状态栏
-        if not self._serial_is_running or self._latest_frame is None:
-            self._statusbar.showMessage(
-                f"数据源: {self._data_source_text} | 状态: {self._serial_state_text} | "
-                f"数据FPS: {self._data_fps:.1f} | 已收帧: {self._frame_count} | 串口RX: {self._serial_rx_total} bytes"
-            )
-            return
+            m = frame.matrix
+            self._heatmap.set_matrix(m)
 
-        frame = self._latest_frame
-        matrix = frame.matrix
-        self._heatmap.set_matrix(matrix)
+            total_n = float(np.sum(m))
+            peak_n = float(np.max(m))
 
-        total_raw = float(np.sum(matrix))
-        current_raw = float(np.max(matrix))
+            self._session_max = max(self._session_max, peak_n)
+            self._session_min = min(self._session_min, peak_n)
 
-        self._session_max = max(self._session_max, current_raw)
-        self._session_min = min(self._session_min, current_raw)
+            if self._plot_t0_sensor_ts is None:
+                self._plot_t0_sensor_ts = frame.timestamp
+            t = frame.timestamp - self._plot_t0_sensor_ts
 
-        # 【修复3】仅当 _serial_is_running 为 True 时才累积数据到曲线
-        if self._serial_is_running:
-            t = time.time() - self._t0
             self._time_hist.append(t)
-            self._total_hist.append(total_raw)
-            self._current_hist.append(current_raw)
+            self._total_hist.append(total_n)
+            self._current_hist.append(peak_n)
 
-        self._curve_total.setData(list(self._time_hist), list(self._total_hist))
-        self._curve_current.setData(list(self._time_hist), list(self._current_hist))
-        self.apply_plot_time_window()
+            self._curve_total.setData(list(self._time_hist), list(self._total_hist))
+            self._curve_current.setData(list(self._time_hist), list(self._current_hist))
+            self.apply_plot_time_window()
 
-        self._val_total.setText(f"{self.format_value(total_raw)} {self._unit_text}")
-        self._val_current.setText(f"{self.format_value(current_raw)} {self._unit_text}")
-        self._val_max.setText(f"{self.format_value(self._session_max)} {self._unit_text}")
-        self._val_min.setText(f"{self.format_value(self._session_min)} {self._unit_text}")
+            self._frame_count += 1
+
+            self._val_total.setText(f"{self._fmt(total_n)} {self._unit_text}")
+            self._val_current.setText(f"{self._fmt(peak_n)} {self._unit_text}")
+            self._val_max.setText(f"{self._fmt(self._session_max)} {self._unit_text}")
+            self._val_min.setText(f"{self._fmt(self._session_min)} {self._unit_text}")
 
         now = time.time()
         if self._last_ui_time is not None:
@@ -974,21 +944,21 @@ class MainWindow(QMainWindow):
                 self._ui_fps = 1.0 / dt
         self._last_ui_time = now
 
-        self._statusbar.showMessage(
-            f"数据源: {self._data_source_text} | 状态: {self._serial_state_text} | "
-            f"数据FPS: {self._data_fps:.1f} | UI FPS: {self._ui_fps:.1f} | "
-            f"已收帧: {self._frame_count} | 串口RX: {self._serial_rx_total} bytes"
-        )
+        if self._calib_active:
+            self._update_status(f"标定中({self._calib_count}/{self._calib_need_frames})")
+        else:
+            self._update_status()
 
     def closeEvent(self, event) -> None:
-        self.stop_serial_worker()
+        self.on_close_clicked()
         event.accept()
 
 
 def main() -> int:
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    pg.setConfigOptions(antialias=True)
+    w = MainWindow()
+    w.show()
     return app.exec()
 
 
