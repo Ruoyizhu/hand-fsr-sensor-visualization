@@ -114,7 +114,6 @@ def load_sensor_mapping_from_logs(log_dir: str = "logs") -> tuple[float, float]:
 
                         # 硬件故障补偿：第3列 <- 第4列
                         row[2] = row[3]
-
                         values.extend(row)
             except Exception:
                 pass
@@ -174,10 +173,17 @@ class TextFrameParser:
         if decoded:
             self._text_buffer += decoded
 
-        while "\n" in self._text_buffer:
-            raw_line, self._text_buffer = self._text_buffer.split("\n", 1)
+        # 用 find 逐行提取，减少 split 大量临时对象
+        start = 0
+        while True:
+            idx = self._text_buffer.find("\n", start)
+            if idx < 0:
+                break
+            raw_line = self._text_buffer[:idx]
+            self._text_buffer = self._text_buffer[idx + 1 :]
             line = raw_line.rstrip("\r")
             self._consume_line(line, frames)
+            start = 0
 
         return frames
 
@@ -244,14 +250,14 @@ class SerialByteSource:
             return []
         return [p.device for p in serial.tools.list_ports.comports()]
 
-    def open(self, port: str, baudrate: int, timeout: float = 0.02) -> None:
+    def open(self, port: str, baudrate: int, timeout: float = 0.0) -> None:
         if not SERIAL_AVAILABLE:
             raise RuntimeError("pyserial 未安装")
         self._ser = serial.Serial(
             port=port,
             baudrate=baudrate,
-            timeout=timeout,
-            write_timeout=timeout,
+            timeout=timeout,  # 非阻塞读取
+            write_timeout=timeout if timeout > 0 else 0.1,
         )
 
     def close(self) -> None:
@@ -265,21 +271,47 @@ class SerialByteSource:
     def is_open(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
-    def read_bytes(self, max_bytes: int = 2048) -> bytes:
+    def read_latest_bytes(self, max_chunk: int = 32768, backlog_limit: int = 131072) -> tuple[bytes, bool]:
+        """
+        返回一个尽量新的数据块，必要时主动丢弃过大积压，避免显示延迟。
+        """
         if not self.is_open():
-            return b""
+            return b"", False
+
+        dropped = False
         waiting = self._ser.in_waiting if self._ser is not None else 0
-        size = min(max(1, waiting), max_bytes)
-        return self._ser.read(size)
+
+        if waiting > backlog_limit:
+            try:
+                self._ser.reset_input_buffer()
+                return b"", True
+            except Exception:
+                pass
+
+        if waiting <= 0:
+            return b"", False
+
+        size = min(waiting, max_chunk)
+        data = self._ser.read(size)
+
+        waiting_after = self._ser.in_waiting if self._ser is not None else 0
+        if waiting_after > backlog_limit // 2:
+            try:
+                self._ser.reset_input_buffer()
+                dropped = True
+            except Exception:
+                pass
+
+        return data, dropped
 
 
 class SerialWorker(QObject):
-    bytes_received = pyqtSignal(bytes)
+    bytes_stat = pyqtSignal(int)
     frame_received = pyqtSignal(object)
     status_changed = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, port: str, baudrate: int, timeout: float = 0.02) -> None:
+    def __init__(self, port: str, baudrate: int, timeout: float = 0.0) -> None:
         super().__init__()
         self._running = False
         self._port = port
@@ -296,6 +328,16 @@ class SerialWorker(QObject):
         )
         self._frame_index = 0
 
+        # 实时性优化：投递频率控制在接近UI频率，减少Qt队列堆积导致的延迟
+        self._emit_interval_s = 1.0 / 50.0
+        self._last_emit_ts = 0.0
+        self._latest_frame_cache: Optional[Frame] = None
+
+        # 批量bytes统计，减少信号开销
+        self._bytes_acc = 0
+        self._last_bytes_emit_ts = 0.0
+        self._bytes_emit_interval_s = 0.1
+
     @pyqtSlot()
     def run(self) -> None:
         self._running = True
@@ -310,37 +352,59 @@ class SerialWorker(QObject):
         try:
             while self._running:
                 try:
-                    data = self._source.read_bytes(max_bytes=2048)
+                    data, dropped = self._source.read_latest_bytes(
+                        max_chunk=32768,
+                        backlog_limit=131072,
+                    )
                 except Exception:
                     self.status_changed.emit("读取异常")
                     break
 
+                now = time.perf_counter()
+
+                if dropped:
+                    self._parser.reset()
+                    self._latest_frame_cache = None
+
+                if data:
+                    self._bytes_acc += len(data)
+
+                    matrices = self._parser.feed(data)
+                    if matrices:
+                        # 丢旧保新：同一批只保留最新矩阵
+                        last_mat = matrices[-1]
+                        self._frame_index += len(matrices) - 1
+                        self._latest_frame_cache = Frame(
+                            timestamp=time.time(),
+                            index=self._frame_index,
+                            matrix=last_mat,
+                            scenario="sensor",
+                        )
+                        self._frame_index += 1
+
+                # 限频发帧：始终发最新帧，避免排队
+                if self._latest_frame_cache is not None and (now - self._last_emit_ts) >= self._emit_interval_s:
+                    self.frame_received.emit(self._latest_frame_cache)
+                    self._latest_frame_cache = None
+                    self._last_emit_ts = now
+
+                # 批量发送bytes统计
+                if self._bytes_acc > 0 and (now - self._last_bytes_emit_ts) >= self._bytes_emit_interval_s:
+                    self.bytes_stat.emit(self._bytes_acc)
+                    self._bytes_acc = 0
+                    self._last_bytes_emit_ts = now
+
+                # 无数据时短暂休眠，避免CPU满载
                 if not data:
-                    continue
+                    time.sleep(0.0005)
 
-                self.bytes_received.emit(data)
-
-                # 关键降延迟：同一批只发最新一帧，避免UI队列堆积
-                matrices = self._parser.feed(data)
-                if not matrices:
-                    continue
-
-                last_mat = matrices[-1]
-                # 补齐索引：中间帧视为丢弃，但计数前移
-                self._frame_index += len(matrices) - 1
-                frame = Frame(
-                    timestamp=time.time(),
-                    index=self._frame_index,
-                    matrix=last_mat,
-                    scenario="sensor",
-                )
-                self._frame_index += 1
-                self.frame_received.emit(frame)
         finally:
             try:
                 self._source.close()
             except Exception:
                 pass
+            if self._bytes_acc > 0:
+                self.bytes_stat.emit(self._bytes_acc)
             self.status_changed.emit("已关闭")
             self.finished.emit()
 
@@ -406,7 +470,6 @@ class HeatmapGridWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-
         painter.fillRect(self.rect(), self.palette().window())
 
         w, h = self.width(), self.height()
@@ -448,6 +511,7 @@ class MainWindow(QMainWindow):
         self._serial_worker: Optional[SerialWorker] = None
         self._stream_active = False
 
+        # 最新帧邮箱：只保留最近一帧，避免旧帧排队
         self._pending_frame: Optional[Frame] = None
         self._has_pending_frame = False
         self._latest_frame: Optional[Frame] = None
@@ -468,23 +532,27 @@ class MainWindow(QMainWindow):
         self._total_hist = deque(maxlen=2400)
         self._current_hist = deque(maxlen=2400)
         self._plot_t0_sensor_ts: Optional[float] = None
+        self._last_plot_update_ts = 0.0
+        self._plot_update_interval_s = 1.0 / 12.0  # 曲线12Hz，减轻负载
+        self._last_plotted_count = 0
 
         self._decimals = self._settings.value("display/decimals", 1, type=int)
-        self._ui_interval_ms = self._settings.value("display/ui_interval_ms", 33, type=int)
+        self._ui_interval_ms = self._settings.value("display/ui_interval_ms", 20, type=int)
         self._unit_text = "N"
 
-        # 映射参数：原始 -> 0..20N
         self._raw_min, self._raw_max = load_sensor_mapping_from_logs("logs")
         self._force_max_n = 20.0
 
-        # 自动标定参数
         self._zero_offset = np.zeros((16, 16), dtype=np.float32)
         self._calib_sum = np.zeros((16, 16), dtype=np.float64)
         self._calib_count = 0
         self._calib_active = False
         self._calib_need_frames = 10
 
-        # 控件
+        # 状态栏降频刷新，减少字符串拼接和UI更新开销
+        self._last_status_update_ts = 0.0
+        self._status_update_interval_s = 0.2
+
         self._btn_refresh_ports = QPushButton("刷新串口")
         self._combo_ports = QComboBox()
         self._combo_baud = QComboBox()
@@ -493,6 +561,7 @@ class MainWindow(QMainWindow):
         self._btn_open = QPushButton("打开串口")
         self._btn_close = QPushButton("关闭串口")
         self._btn_close.setEnabled(False)
+        self._btn_zero = QPushButton("清零")
 
         self._spin_gap = QSpinBox()
         self._spin_gap.setRange(0, 8)
@@ -503,11 +572,10 @@ class MainWindow(QMainWindow):
         self._spin_decimals.setValue(max(0, min(6, int(self._decimals))))
 
         self._spin_ui_interval = QSpinBox()
-        self._spin_ui_interval.setRange(10, 100)
-        self._spin_ui_interval.setValue(max(10, min(100, int(self._ui_interval_ms))))
+        self._spin_ui_interval.setRange(20, 100)
+        self._spin_ui_interval.setValue(max(20, min(100, int(self._ui_interval_ms))))
         self._spin_ui_interval.setSuffix(" ms")
 
-        # 热力图阈值手动调节
         saved_vmin = self._settings.value("display/vmin", 0.0, type=float)
         saved_vmax = self._settings.value("display/vmax", 20.0, type=float)
 
@@ -543,7 +611,6 @@ class MainWindow(QMainWindow):
         self._val_min = QLabel("-")
         self._make_value_labels()
 
-        # 布局
         controls = QHBoxLayout()
         controls.addWidget(self._btn_refresh_ports)
         controls.addWidget(QLabel("端口"))
@@ -552,6 +619,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._combo_baud)
         controls.addWidget(self._btn_open)
         controls.addWidget(self._btn_close)
+        controls.addWidget(self._btn_zero)
         controls.addSpacing(12)
         controls.addWidget(QLabel("间隙"))
         controls.addWidget(self._spin_gap)
@@ -617,10 +685,10 @@ class MainWindow(QMainWindow):
         self._statusbar = QStatusBar(self)
         self.setStatusBar(self._statusbar)
 
-        # 信号
         self._btn_refresh_ports.clicked.connect(self.on_refresh_ports_clicked)
         self._btn_open.clicked.connect(self.on_open_clicked)
         self._btn_close.clicked.connect(self.on_close_clicked)
+        self._btn_zero.clicked.connect(self.on_zero_clicked)
         self._spin_gap.valueChanged.connect(self._heatmap.set_gap)
         self._spin_decimals.valueChanged.connect(self.on_display_settings_changed)
         self._spin_ui_interval.valueChanged.connect(self.on_display_settings_changed)
@@ -628,16 +696,16 @@ class MainWindow(QMainWindow):
         self._spin_vmax.valueChanged.connect(self.on_vrange_changed)
         self._combo_time_window.currentTextChanged.connect(self.apply_plot_time_window)
 
-        # 定时器：只负责“消费最新帧”和状态刷新
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(self._spin_ui_interval.value())
+        self._ui_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._ui_timer.timeout.connect(self.refresh_ui)
         self._ui_timer.start()
 
         self.apply_display_settings()
         self.on_refresh_ports_clicked()
         self.apply_plot_time_window()
-        self._update_status("系统就绪")
+        self._update_status("系统就绪", force=True)
 
     def _make_value_labels(self) -> None:
         for v in [self._val_total, self._val_current, self._val_max, self._val_min]:
@@ -649,6 +717,7 @@ class MainWindow(QMainWindow):
         plot.setBackground("w")
         plot.showGrid(x=True, y=True, alpha=0.2)
         plot.setClipToView(True)
+        plot.setDownsampling(auto=True, mode="peak")
         ax_l = plot.getAxis("left")
         ax_b = plot.getAxis("bottom")
         ax_l.setPen(pg.mkPen("k", width=1))
@@ -657,13 +726,18 @@ class MainWindow(QMainWindow):
         ax_b.setTextPen(pg.mkPen("k"))
         plot.setLabel("bottom", "Time(s)", color="#000000")
 
-    def _update_status(self, prefix: str = "") -> None:
+    def _update_status(self, prefix: str = "", force: bool = False) -> None:
+        now = time.perf_counter()
+        if (not force) and (now - self._last_status_update_ts < self._status_update_interval_s):
+            return
+
         msg = (
             f"{prefix} | 数据源: 传感器 | 状态: {self._serial_state_text} | "
             f"已收帧: {self._frame_count} | 数据FPS: {self._data_fps:.1f} | "
             f"UI FPS: {self._ui_fps:.1f} | 串口RX: {self._serial_rx_total} bytes"
         )
         self._statusbar.showMessage(msg)
+        self._last_status_update_ts = now
 
     def _get_time_window_seconds(self) -> Optional[float]:
         t = self._combo_time_window.currentText().strip()
@@ -691,7 +765,6 @@ class MainWindow(QMainWindow):
         self._plot_current.setXRange(t_start, t_end, padding=0.0)
 
     def _build_correction(self, matrix: np.ndarray) -> np.ndarray:
-        # 硬件故障补偿：第3列 <- 第4列
         out = matrix.astype(np.float32, copy=True)
         if out.shape == (16, 16):
             out[:, 2] = out[:, 3]
@@ -708,12 +781,25 @@ class MainWindow(QMainWindow):
         mapped = norm * self._force_max_n
         return mapped.astype(np.float32)
 
+    def _transform_for_heatmap_layout(self, matrix: np.ndarray) -> np.ndarray:
+        """
+        物理布局 -> 热力图布局坐标变换
+        满足：
+        实际左上 -> 图右下
+        实际右上 -> 图右上
+        实际左下 -> 图左下
+        实际右下 -> 图左上
+
+        实现方式：先上下+左右翻转，再转置（等价于沿副对角线镜像）
+        """
+        return np.flipud(np.fliplr(matrix)).T.astype(np.float32, copy=False)
+
     def _start_calibration(self) -> None:
         self._calib_sum = np.zeros((16, 16), dtype=np.float64)
         self._calib_count = 0
         self._calib_active = True
         self._zero_offset = np.zeros((16, 16), dtype=np.float32)
-        self._update_status("正在自动标定零点")
+        self._update_status("正在自动标定零点", force=True)
 
     def _finish_calibration(self) -> None:
         if self._calib_count > 0:
@@ -721,7 +807,35 @@ class MainWindow(QMainWindow):
         else:
             self._zero_offset = np.zeros((16, 16), dtype=np.float32)
         self._calib_active = False
-        self._update_status("标定完成")
+        self._update_status("标定完成", force=True)
+
+    def _clear_runtime_buffers(self) -> None:
+        self._pending_frame = None
+        self._has_pending_frame = False
+        self._latest_frame = None
+
+        self._frame_count = 0
+        self._data_fps = 0.0
+        self._last_frame_arrival_time = None
+
+        self._session_max = float("-inf")
+        self._session_min = float("inf")
+
+        self._time_hist.clear()
+        self._total_hist.clear()
+        self._current_hist.clear()
+        self._plot_t0_sensor_ts = None
+        self._last_plot_update_ts = 0.0
+        self._last_plotted_count = 0
+
+        self._curve_total.setData([], [])
+        self._curve_current.setData([], [])
+
+        self._heatmap.set_matrix(np.zeros((16, 16), dtype=np.float32))
+        self._val_total.setText("0.0 N")
+        self._val_current.setText("0.0 N")
+        self._val_max.setText("-")
+        self._val_min.setText("-")
 
     @pyqtSlot()
     def on_refresh_ports_clicked(self) -> None:
@@ -753,11 +867,11 @@ class MainWindow(QMainWindow):
             return
 
         self._serial_thread = QThread()
-        self._serial_worker = SerialWorker(port=port, baudrate=baud, timeout=0.02)
+        self._serial_worker = SerialWorker(port=port, baudrate=baud, timeout=0.0)
         self._serial_worker.moveToThread(self._serial_thread)
 
         self._serial_thread.started.connect(self._serial_worker.run)
-        self._serial_worker.bytes_received.connect(self.on_serial_bytes_received)
+        self._serial_worker.bytes_stat.connect(self.on_serial_bytes_stat)
         self._serial_worker.frame_received.connect(self.on_frame_received)
         self._serial_worker.status_changed.connect(self.on_serial_status_changed)
         self._serial_worker.finished.connect(self._serial_thread.quit)
@@ -765,25 +879,9 @@ class MainWindow(QMainWindow):
         self._serial_thread.finished.connect(self._serial_thread.deleteLater)
         self._serial_thread.finished.connect(self.on_serial_thread_finished)
 
-        # 重新开始采集
         self._stream_active = True
         self._serial_rx_total = 0
-        self._frame_count = 0
-        self._data_fps = 0.0
-        self._last_frame_arrival_time = None
-        self._ui_fps = 0.0
-        self._last_ui_time = None
-        self._session_max = float("-inf")
-        self._session_min = float("inf")
-        self._time_hist.clear()
-        self._total_hist.clear()
-        self._current_hist.clear()
-        self._plot_t0_sensor_ts = None
-        self._pending_frame = None
-        self._has_pending_frame = False
-        self._latest_frame = None
-
-        # 自动零点标定
+        self._clear_runtime_buffers()
         self._start_calibration()
 
         self._btn_open.setEnabled(False)
@@ -793,24 +891,36 @@ class MainWindow(QMainWindow):
         self._combo_baud.setEnabled(False)
 
         self._serial_thread.start()
-        self._update_status("打开串口中")
+        self._update_status("打开串口中", force=True)
 
     @pyqtSlot()
     def on_close_clicked(self) -> None:
-        # 先关流开关，立即阻断后续帧进入
         self._stream_active = False
         self._calib_active = False
         self._pending_frame = None
         self._has_pending_frame = False
-
         self.stop_serial_worker()
+        self._update_status("串口已关闭", force=True)
 
-        # 关闭后冻结最后画面，不再延伸曲线
-        self._update_status("串口已关闭")
+    @pyqtSlot()
+    def on_zero_clicked(self) -> None:
+        """
+        清零逻辑：
+        - 串口打开：重新标定 + 清空曲线
+        - 串口关闭：清空显示与曲线
+        """
+        if self._stream_active:
+            self._clear_runtime_buffers()
+            self._start_calibration()
+            self._update_status("手动清零：重新标定中", force=True)
+        else:
+            self._clear_runtime_buffers()
+            self._zero_offset = np.zeros((16, 16), dtype=np.float32)
+            self._update_status("手动清零：已重置", force=True)
 
-    @pyqtSlot(bytes)
-    def on_serial_bytes_received(self, data: bytes) -> None:
-        self._serial_rx_total += len(data)
+    @pyqtSlot(int)
+    def on_serial_bytes_stat(self, byte_count: int) -> None:
+        self._serial_rx_total += int(byte_count)
 
     @pyqtSlot(object)
     def on_frame_received(self, frame: object) -> None:
@@ -826,25 +936,8 @@ class MainWindow(QMainWindow):
                 self._data_fps = 1.0 / dt
         self._last_frame_arrival_time = now
 
-        corrected = self._build_correction(frame.matrix)
-
-        if self._calib_active:
-            self._calib_sum += corrected.astype(np.float64)
-            self._calib_count += 1
-            if self._calib_count >= self._calib_need_frames:
-                self._finish_calibration()
-            return
-
-        zero_fixed = self._apply_zero_offset(corrected)
-        mapped = self._map_to_force_n(zero_fixed)
-
-        # 最新帧覆盖旧帧，避免延迟累积
-        self._pending_frame = Frame(
-            timestamp=frame.timestamp,
-            index=frame.index,
-            matrix=mapped,
-            scenario="sensor",
-        )
+        # 只做轻量入队，重计算延后到UI定时器里处理最新帧
+        self._pending_frame = frame
         self._has_pending_frame = True
 
     @pyqtSlot(str)
@@ -903,46 +996,78 @@ class MainWindow(QMainWindow):
         return f"{v:.{self._decimals}f}"
 
     def refresh_ui(self) -> None:
+        # 高频刷新：只消费最新待处理帧
         if self._stream_active and self._has_pending_frame and self._pending_frame is not None:
-            frame = self._pending_frame
+            raw_frame = self._pending_frame
             self._pending_frame = None
             self._has_pending_frame = False
-            self._latest_frame = frame
 
-            m = frame.matrix
-            self._heatmap.set_matrix(m)
+            corrected = self._build_correction(raw_frame.matrix)
 
-            total_n = float(np.sum(m))
-            peak_n = float(np.max(m))
+            if self._calib_active:
+                self._calib_sum += corrected.astype(np.float64)
+                self._calib_count += 1
+                if self._calib_count >= self._calib_need_frames:
+                    self._finish_calibration()
+            else:
+                zero_fixed = self._apply_zero_offset(corrected)
+                mapped = self._map_to_force_n(zero_fixed)
 
-            self._session_max = max(self._session_max, peak_n)
-            self._session_min = min(self._session_min, peak_n)
+                # 关键：绘制前坐标变换，使热力图方向与物理传感器一致
+                display_matrix = self._transform_for_heatmap_layout(mapped)
+                self._heatmap.set_matrix(display_matrix)
 
-            if self._plot_t0_sensor_ts is None:
-                self._plot_t0_sensor_ts = frame.timestamp
-            t = frame.timestamp - self._plot_t0_sensor_ts
+                total_n = float(np.sum(mapped))
+                peak_n = float(np.max(mapped))
 
-            self._time_hist.append(t)
-            self._total_hist.append(total_n)
-            self._current_hist.append(peak_n)
+                self._session_max = max(self._session_max, peak_n)
+                self._session_min = min(self._session_min, peak_n)
 
-            self._curve_total.setData(list(self._time_hist), list(self._total_hist))
-            self._curve_current.setData(list(self._time_hist), list(self._current_hist))
+                if self._plot_t0_sensor_ts is None:
+                    self._plot_t0_sensor_ts = raw_frame.timestamp
+                t = raw_frame.timestamp - self._plot_t0_sensor_ts
+
+                self._time_hist.append(t)
+                self._total_hist.append(total_n)
+                self._current_hist.append(peak_n)
+
+                self._frame_count += 1
+                self._val_total.setText(f"{self._fmt(total_n)} {self._unit_text}")
+                self._val_current.setText(f"{self._fmt(peak_n)} {self._unit_text}")
+                self._val_max.setText(f"{self._fmt(self._session_max)} {self._unit_text}")
+                self._val_min.setText(f"{self._fmt(self._session_min)} {self._unit_text}")
+
+                self._latest_frame = Frame(
+                    timestamp=raw_frame.timestamp,
+                    index=raw_frame.index,
+                    matrix=mapped,
+                    scenario="sensor",
+                )
+
+        # 低频刷新：曲线（减少CPU占用），且只有新增数据才重绘
+        now = time.perf_counter()
+        hist_len = len(self._time_hist)
+        if (
+            hist_len > 0
+            and hist_len != self._last_plotted_count
+            and (now - self._last_plot_update_ts) >= self._plot_update_interval_s
+        ):
+            t_arr = np.fromiter(self._time_hist, dtype=np.float32)
+            total_arr = np.fromiter(self._total_hist, dtype=np.float32)
+            current_arr = np.fromiter(self._current_hist, dtype=np.float32)
+            self._curve_total.setData(t_arr, total_arr)
+            self._curve_current.setData(t_arr, current_arr)
             self.apply_plot_time_window()
+            self._last_plot_update_ts = now
+            self._last_plotted_count = hist_len
 
-            self._frame_count += 1
-
-            self._val_total.setText(f"{self._fmt(total_n)} {self._unit_text}")
-            self._val_current.setText(f"{self._fmt(peak_n)} {self._unit_text}")
-            self._val_max.setText(f"{self._fmt(self._session_max)} {self._unit_text}")
-            self._val_min.setText(f"{self._fmt(self._session_min)} {self._unit_text}")
-
-        now = time.time()
+        # UI fps
+        now_ui = time.time()
         if self._last_ui_time is not None:
-            dt = now - self._last_ui_time
+            dt = now_ui - self._last_ui_time
             if dt > 0:
                 self._ui_fps = 1.0 / dt
-        self._last_ui_time = now
+        self._last_ui_time = now_ui
 
         if self._calib_active:
             self._update_status(f"标定中({self._calib_count}/{self._calib_need_frames})")
@@ -956,7 +1081,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    pg.setConfigOptions(antialias=True)
+    pg.setConfigOptions(antialias=False)
     w = MainWindow()
     w.show()
     return app.exec()
