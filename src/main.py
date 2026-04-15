@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -24,6 +23,7 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QVBoxLayout,
     QWidget,
+    QGridLayout,
 )
 
 try:
@@ -82,7 +82,7 @@ def _candidate_log_dirs(log_dir: str = "logs") -> List[Path]:
 def load_sensor_mapping_from_logs(log_dir: str = "logs") -> tuple[float, float]:
     """
     从历史日志估计原始量程，返回 (raw_min, raw_max)。
-    使用分位数，降低极端值影响。
+    使用分位数降低极端值影响。
     """
     values: List[float] = []
 
@@ -173,17 +173,14 @@ class TextFrameParser:
         if decoded:
             self._text_buffer += decoded
 
-        # 用 find 逐行提取，减少 split 大量临时对象
-        start = 0
         while True:
-            idx = self._text_buffer.find("\n", start)
+            idx = self._text_buffer.find("\n")
             if idx < 0:
                 break
             raw_line = self._text_buffer[:idx]
             self._text_buffer = self._text_buffer[idx + 1 :]
             line = raw_line.rstrip("\r")
             self._consume_line(line, frames)
-            start = 0
 
         return frames
 
@@ -256,8 +253,8 @@ class SerialByteSource:
         self._ser = serial.Serial(
             port=port,
             baudrate=baudrate,
-            timeout=timeout,  # 非阻塞读取
-            write_timeout=timeout if timeout > 0 else 0.1,
+            timeout=timeout,  # 非阻塞
+            write_timeout=0.1,
         )
 
     def close(self) -> None:
@@ -273,7 +270,7 @@ class SerialByteSource:
 
     def read_latest_bytes(self, max_chunk: int = 32768, backlog_limit: int = 131072) -> tuple[bytes, bool]:
         """
-        返回一个尽量新的数据块，必要时主动丢弃过大积压，避免显示延迟。
+        读取尽量新的数据，必要时丢弃积压。
         """
         if not self.is_open():
             return b"", False
@@ -328,12 +325,11 @@ class SerialWorker(QObject):
         )
         self._frame_index = 0
 
-        # 实时性优化：投递频率控制在接近UI频率，减少Qt队列堆积导致的延迟
+        # 发帧限频：与UI刷新频率接近，降低事件堆积
         self._emit_interval_s = 1.0 / 50.0
         self._last_emit_ts = 0.0
         self._latest_frame_cache: Optional[Frame] = None
 
-        # 批量bytes统计，减少信号开销
         self._bytes_acc = 0
         self._last_bytes_emit_ts = 0.0
         self._bytes_emit_interval_s = 0.1
@@ -371,7 +367,6 @@ class SerialWorker(QObject):
 
                     matrices = self._parser.feed(data)
                     if matrices:
-                        # 丢旧保新：同一批只保留最新矩阵
                         last_mat = matrices[-1]
                         self._frame_index += len(matrices) - 1
                         self._latest_frame_cache = Frame(
@@ -382,22 +377,18 @@ class SerialWorker(QObject):
                         )
                         self._frame_index += 1
 
-                # 限频发帧：始终发最新帧，避免排队
                 if self._latest_frame_cache is not None and (now - self._last_emit_ts) >= self._emit_interval_s:
                     self.frame_received.emit(self._latest_frame_cache)
                     self._latest_frame_cache = None
                     self._last_emit_ts = now
 
-                # 批量发送bytes统计
                 if self._bytes_acc > 0 and (now - self._last_bytes_emit_ts) >= self._bytes_emit_interval_s:
                     self.bytes_stat.emit(self._bytes_acc)
                     self._bytes_acc = 0
                     self._last_bytes_emit_ts = now
 
-                # 无数据时短暂休眠，避免CPU满载
                 if not data:
                     time.sleep(0.0005)
-
         finally:
             try:
                 self._source.close()
@@ -424,7 +415,7 @@ class HeatmapGridWidget(QWidget):
         self.vmax = 20.0
         self._matrix = np.zeros((rows, cols), dtype=np.float32)
         self._lut = self._build_jet_lut()
-        self.setMinimumSize(360, 360)
+        self.setMinimumSize(420, 420)
         self.setAutoFillBackground(True)
 
     def set_matrix(self, matrix: np.ndarray) -> None:
@@ -503,7 +494,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Hand FSR Demo")
-        self.resize(1500, 900)
+        self.resize(1520, 930)
 
         self._settings = QSettings("NJIT", "HandFSR")
 
@@ -511,7 +502,6 @@ class MainWindow(QMainWindow):
         self._serial_worker: Optional[SerialWorker] = None
         self._stream_active = False
 
-        # 最新帧邮箱：只保留最近一帧，避免旧帧排队
         self._pending_frame: Optional[Frame] = None
         self._has_pending_frame = False
         self._latest_frame: Optional[Frame] = None
@@ -533,7 +523,7 @@ class MainWindow(QMainWindow):
         self._current_hist = deque(maxlen=2400)
         self._plot_t0_sensor_ts: Optional[float] = None
         self._last_plot_update_ts = 0.0
-        self._plot_update_interval_s = 1.0 / 12.0  # 曲线12Hz，减轻负载
+        self._plot_update_interval_s = 1.0 / 12.0
         self._last_plotted_count = 0
 
         self._decimals = self._settings.value("display/decimals", 1, type=int)
@@ -549,7 +539,6 @@ class MainWindow(QMainWindow):
         self._calib_active = False
         self._calib_need_frames = 10
 
-        # 状态栏降频刷新，减少字符串拼接和UI更新开销
         self._last_status_update_ts = 0.0
         self._status_update_interval_s = 0.2
 
@@ -594,24 +583,27 @@ class MainWindow(QMainWindow):
         self._heatmap = HeatmapGridWidget(rows=16, cols=16, gap_px=2)
         self._heatmap.set_vrange(self._spin_vmin.value(), self._spin_vmax.value())
 
-        self._plot_total = pg.PlotWidget(title="总力 - 时间")
-        self._plot_current = pg.PlotWidget(title="峰值 - 时间")
-        self._setup_plot(self._plot_total)
-        self._setup_plot(self._plot_current)
-        self._curve_total = self._plot_total.plot([], [], pen=pg.mkPen("k", width=2))
-        self._curve_current = self._plot_current.plot([], [], pen=pg.mkPen("k", width=2, style=Qt.PenStyle.DashLine))
+        self._plot_total = pg.PlotWidget()
+        self._plot_current = pg.PlotWidget()
+        self._setup_plot(self._plot_total, "总力曲线")
+        self._setup_plot(self._plot_current, "峰值曲线")
+        self._curve_total = self._plot_total.plot([], [], pen=pg.mkPen("#111111", width=2))
+        self._curve_current = self._plot_current.plot([], [], pen=pg.mkPen("#111111", width=2, style=Qt.PenStyle.DashLine))
 
         self._combo_time_window = QComboBox()
         self._combo_time_window.addItems(["10 s", "30 s", "60 s", "截至当前"])
         self._combo_time_window.setCurrentText("30 s")
 
+        # 2x2 数据卡片（标题居中、加粗加大；值居中）
         self._val_total = QLabel("0.0 N")
         self._val_current = QLabel("0.0 N")
         self._val_max = QLabel("-")
         self._val_min = QLabel("-")
-        self._make_value_labels()
+        self._metrics_widget = self._build_metrics_grid()
 
         controls = QHBoxLayout()
+        controls.setSpacing(10)
+        controls.setContentsMargins(8, 8, 8, 8)
         controls.addWidget(self._btn_refresh_ports)
         controls.addWidget(QLabel("端口"))
         controls.addWidget(self._combo_ports)
@@ -620,7 +612,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._btn_open)
         controls.addWidget(self._btn_close)
         controls.addWidget(self._btn_zero)
-        controls.addSpacing(12)
+        controls.addSpacing(8)
         controls.addWidget(QLabel("间隙"))
         controls.addWidget(self._spin_gap)
         controls.addWidget(QLabel("小数"))
@@ -634,26 +626,24 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("单位 N"))
         controls.addStretch()
 
+        # 控制行更明显
+        controls_bar = QWidget()
+        controls_bar.setLayout(controls)
+        controls_bar.setMinimumHeight(70)
+        controls_bar.setStyleSheet("QWidget { background: #f6f7f9; }")
+
         left = QVBoxLayout()
         left_title = QLabel("热力图（传感器）")
-        f = QFont()
-        f.setBold(True)
-        f.setPointSize(11)
-        left_title.setFont(f)
+        lf = QFont()
+        lf.setBold(True)
+        lf.setPointSize(12)
+        left_title.setFont(lf)
+        left_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left.addWidget(left_title)
         left.addWidget(self._heatmap, stretch=1)
+        left.setSpacing(8)
         left_w = QWidget()
         left_w.setLayout(left)
-
-        metrics = QGridLayout()
-        metrics.addWidget(QLabel("总力 (N)"), 0, 0)
-        metrics.addWidget(self._val_total, 0, 1)
-        metrics.addWidget(QLabel("当前峰值 (N)"), 1, 0)
-        metrics.addWidget(self._val_current, 1, 1)
-        metrics.addWidget(QLabel("会话最大 (N)"), 2, 0)
-        metrics.addWidget(self._val_max, 2, 1)
-        metrics.addWidget(QLabel("会话最小 (N)"), 3, 0)
-        metrics.addWidget(self._val_min, 3, 1)
 
         tw = QHBoxLayout()
         tw.addWidget(QLabel("时间窗"))
@@ -662,22 +652,28 @@ class MainWindow(QMainWindow):
 
         right = QVBoxLayout()
         right_title = QLabel("实时数据分析")
-        right_title.setFont(f)
+        right_title.setFont(lf)
+        right_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right.addWidget(right_title)
-        right.addLayout(metrics)
+        right.addWidget(self._metrics_widget)
         right.addLayout(tw)
         right.addWidget(self._plot_total, stretch=1)
         right.addWidget(self._plot_current, stretch=1)
+        right.setSpacing(8)
         right_w = QWidget()
         right_w.setLayout(right)
 
         work = QHBoxLayout()
-        work.addWidget(left_w, stretch=3)
-        work.addWidget(right_w, stretch=2)
+        # 热力图略大于数据模块
+        work.addWidget(left_w, stretch=6)
+        work.addWidget(right_w, stretch=5)
+        work.setSpacing(12)
+        work.setContentsMargins(6, 6, 6, 6)
 
         root = QVBoxLayout()
-        root.addLayout(controls)
+        root.addWidget(controls_bar)
         root.addLayout(work, stretch=1)
+        root.setSpacing(8)
         root_w = QWidget()
         root_w.setLayout(root)
         self.setCentralWidget(root_w)
@@ -707,24 +703,63 @@ class MainWindow(QMainWindow):
         self.apply_plot_time_window()
         self._update_status("系统就绪", force=True)
 
-    def _make_value_labels(self) -> None:
-        for v in [self._val_total, self._val_current, self._val_max, self._val_min]:
-            v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            v.setStyleSheet("QLabel { background: white; border: 1px solid #BFBFBF; padding: 4px 8px; }")
-            v.setMinimumWidth(140)
+    def _build_metric_card(self, title: str, value_label: QLabel) -> QWidget:
+        card = QWidget()
+        card.setStyleSheet(
+            "QWidget { background: white; border: 1px solid #BFBFBF; border-radius: 4px; }"
+            "QLabel { border: none; }"
+        )
+        lay = QVBoxLayout()
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
 
-    def _setup_plot(self, plot: pg.PlotWidget) -> None:
+        title_label = QLabel(title)
+        tf = QFont()
+        tf.setBold(True)
+        tf.setPointSize(11)
+        title_label.setFont(tf)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        vf = QFont()
+        vf.setBold(True)
+        vf.setPointSize(13)
+        value_label.setFont(vf)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lay.addWidget(title_label)
+        lay.addWidget(value_label)
+        card.setLayout(lay)
+        return card
+
+    def _build_metrics_grid(self) -> QWidget:
+        w = QWidget()
+        g = QGridLayout()
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(8)
+
+        g.addWidget(self._build_metric_card("总力 (N)", self._val_total), 0, 0)
+        g.addWidget(self._build_metric_card("当前峰值 (N)", self._val_current), 0, 1)
+        g.addWidget(self._build_metric_card("会话最大 (N)", self._val_max), 1, 0)
+        g.addWidget(self._build_metric_card("会话最小 (N)", self._val_min), 1, 1)
+
+        w.setLayout(g)
+        return w
+
+    def _setup_plot(self, plot: pg.PlotWidget, title_text: str) -> None:
+        # 标题实心填充 + 居中
+        plot.setTitle(f"<div style='background:#e6ebf2; padding:4px; text-align:center;'><b>{title_text}</b></div>")
         plot.setBackground("w")
         plot.showGrid(x=True, y=True, alpha=0.2)
         plot.setClipToView(True)
         plot.setDownsampling(auto=True, mode="peak")
-        ax_l = plot.getAxis("left")
-        ax_b = plot.getAxis("bottom")
-        ax_l.setPen(pg.mkPen("k", width=1))
-        ax_b.setPen(pg.mkPen("k", width=1))
-        ax_l.setTextPen(pg.mkPen("k"))
-        ax_b.setTextPen(pg.mkPen("k"))
-        plot.setLabel("bottom", "Time(s)", color="#000000")
+        plot.getAxis("left").setPen(pg.mkPen("k", width=1))
+        plot.getAxis("bottom").setPen(pg.mkPen("k", width=1))
+        plot.getAxis("left").setTextPen(pg.mkPen("k"))
+        plot.getAxis("bottom").setTextPen(pg.mkPen("k"))
+        # 纵轴单位
+        plot.setLabel("left", "Force", units="N", color="#000000")
+        plot.setLabel("bottom", "Time", units="s", color="#000000")
 
     def _update_status(self, prefix: str = "", force: bool = False) -> None:
         now = time.perf_counter()
@@ -789,8 +824,6 @@ class MainWindow(QMainWindow):
         实际右上 -> 图右上
         实际左下 -> 图左下
         实际右下 -> 图左上
-
-        实现方式：先上下+左右翻转，再转置（等价于沿副对角线镜像）
         """
         return np.flipud(np.fliplr(matrix)).T.astype(np.float32, copy=False)
 
@@ -904,11 +937,6 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def on_zero_clicked(self) -> None:
-        """
-        清零逻辑：
-        - 串口打开：重新标定 + 清空曲线
-        - 串口关闭：清空显示与曲线
-        """
         if self._stream_active:
             self._clear_runtime_buffers()
             self._start_calibration()
@@ -936,7 +964,6 @@ class MainWindow(QMainWindow):
                 self._data_fps = 1.0 / dt
         self._last_frame_arrival_time = now
 
-        # 只做轻量入队，重计算延后到UI定时器里处理最新帧
         self._pending_frame = frame
         self._has_pending_frame = True
 
@@ -996,7 +1023,6 @@ class MainWindow(QMainWindow):
         return f"{v:.{self._decimals}f}"
 
     def refresh_ui(self) -> None:
-        # 高频刷新：只消费最新待处理帧
         if self._stream_active and self._has_pending_frame and self._pending_frame is not None:
             raw_frame = self._pending_frame
             self._pending_frame = None
@@ -1013,7 +1039,7 @@ class MainWindow(QMainWindow):
                 zero_fixed = self._apply_zero_offset(corrected)
                 mapped = self._map_to_force_n(zero_fixed)
 
-                # 关键：绘制前坐标变换，使热力图方向与物理传感器一致
+                # 绘制前做坐标变换
                 display_matrix = self._transform_for_heatmap_layout(mapped)
                 self._heatmap.set_matrix(display_matrix)
 
@@ -1044,7 +1070,6 @@ class MainWindow(QMainWindow):
                     scenario="sensor",
                 )
 
-        # 低频刷新：曲线（减少CPU占用），且只有新增数据才重绘
         now = time.perf_counter()
         hist_len = len(self._time_hist)
         if (
@@ -1061,7 +1086,6 @@ class MainWindow(QMainWindow):
             self._last_plot_update_ts = now
             self._last_plotted_count = hist_len
 
-        # UI fps
         now_ui = time.time()
         if self._last_ui_time is not None:
             dt = now_ui - self._last_ui_time
