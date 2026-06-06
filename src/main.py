@@ -3,6 +3,7 @@ import re
 import sys
 import time
 from collections import deque
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -633,7 +634,7 @@ class MainWindow(QMainWindow):
         controls_bar.setStyleSheet("QWidget { background: #f6f7f9; }")
 
         left = QVBoxLayout()
-        left_title = QLabel("热力图（传感器）")
+        left_title = QLabel("热力图")
         lf = QFont()
         lf.setBold(True)
         lf.setPointSize(12)
@@ -748,7 +749,7 @@ class MainWindow(QMainWindow):
 
     def _setup_plot(self, plot: pg.PlotWidget, title_text: str) -> None:
         # 标题实心填充 + 居中
-        plot.setTitle(f"<div style='background:#e6ebf2; padding:4px; text-align:center;'><b>{title_text}</b></div>")
+        plot.setTitle(f"<div style='color:#000000; padding:4px; text-align:center;'><b>{title_text}</b></div>")
         plot.setBackground("w")
         plot.showGrid(x=True, y=True, alpha=0.2)
         plot.setClipToView(True)
